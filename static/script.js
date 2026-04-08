@@ -174,6 +174,7 @@ async function startProcessing() {
         mask_audio: $("#opt-audio").checked,
         deep_stealth: $("#opt-deep").checked,
         v3: $("#opt-v3").checked,
+        audio_stealth: $("#opt-audio-stealth").checked,
     };
 
     try {

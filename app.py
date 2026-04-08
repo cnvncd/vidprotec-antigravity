@@ -270,11 +270,12 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 def process_video_file(src: Path, dst: Path, strength: int,
                         anti_ocr: bool, distort_scene: bool,
                         mask_audio: bool, deep_stealth: bool = False,
-                        v3: bool = False,
+                        v3: bool = False, audio_stealth: bool = False,
                         on_progress=None):
     """
     Process a video frame-by-frame with adversarial perturbation + metadata strip.
     v3 adds Neural Warp and Chroma Attack.
+    v3.1 adds Audio Deep Stealth.
     """
     tmp_dir = dst.parent / f"_tmp_{dst.stem}"
     tmp_dir.mkdir(exist_ok=True)
@@ -349,6 +350,27 @@ def process_video_file(src: Path, dst: Path, strength: int,
                 _mask_audio(audio_tmp, masked_audio, strength)
                 final_audio = masked_audio
 
+            # v3.1 Audio Deep Stealth (Phase & Spectral Attack)
+            if audio_stealth:
+                stealth_audio = str(tmp_dir / "audio_stealth.wav")
+                # Advanced filters:
+                # - aphaser: phase distortion
+                # - aecho: spectral smearing
+                # - tremolo: irregular LFO amplitude
+                # - vibrato: irregular LFO pitch
+                filters = [
+                    f"aphaser=in_gain=0.6:out_gain=0.8:delay=3:speed=1:type=t",
+                    f"aecho=0.8:0.88:30:0.4",
+                    f"tremolo=f=4:d=0.3",
+                    f"vibrato=f=2:d=0.2"
+                ]
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", final_audio,
+                    "-af", ",".join(filters),
+                    stealth_audio
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                final_audio = stealth_audio
+
             # v3 Audio Jitter (Pitch shift)
             if v3:
                 jitter_audio = str(tmp_dir / "audio_jitter.wav")
@@ -398,7 +420,7 @@ def _mux_video_audio(video_path: str, audio_path: str, output_path: str):
 
 def _run_job(job_id: str, files_meta: list, strength: int,
              anti_ocr: bool, distort_scene: bool, mask_audio_flag: bool,
-             deep_stealth: bool, v3: bool):
+             deep_stealth: bool, v3: bool, audio_stealth: bool):
     """Process every file in the job. Runs in a background thread."""
     job_output = OUTPUT_DIR / job_id
     job_output.mkdir(exist_ok=True)
@@ -418,7 +440,8 @@ def _run_job(job_id: str, files_meta: list, strength: int,
                 def progress_cb(pct, _i=i):
                     _update_file_status(job_id, _i, "processing", pct)
                 process_video_file(src, dst, strength, anti_ocr, distort_scene,
-                                   mask_audio_flag, deep_stealth, v3, on_progress=progress_cb)
+                                   mask_audio_flag, deep_stealth, v3, audio_stealth,
+                                   on_progress=progress_cb)
                 _update_file_status(job_id, i, "done", 100)
             else:
                 _update_file_status(job_id, i, "error", 0)
@@ -509,10 +532,11 @@ def process(job_id: str):
     mask_audio_flag = bool(body.get("mask_audio", False))
     deep_stealth = bool(body.get("deep_stealth", False))
     v3 = bool(body.get("v3", False))
+    audio_stealth = bool(body.get("audio_stealth", False))
 
     t = threading.Thread(
         target=_run_job,
-        args=(job_id, job["files"], strength, anti_ocr, distort_scene, mask_audio_flag, deep_stealth, v3),
+        args=(job_id, job["files"], strength, anti_ocr, distort_scene, mask_audio_flag, deep_stealth, v3, audio_stealth),
         daemon=True
     )
     t.start()

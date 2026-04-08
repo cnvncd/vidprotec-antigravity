@@ -67,9 +67,9 @@ python app.py
 | Функция | Описание |
 |---------|----------|
 | 🖼️ Adversarial-шум для фото | Ломает OCR, object detection, scene understanding |
-| 🎬 Динамический шум v2 | Шум меняется на каждом кадре (только в v2) |
-| 🕵️ Deep Stealth Mode | **Anti-Hash, Jitter & Metadata Strip** (специально для ТТ) |
-| 🔇 Маскировка аудио | Неслышимый шум, который ломает Whisper/Deepgram |
+| 🎬 Динамический шум v3 | Neural Warp (искажение сетки) & YCbCr атака |
+| 🕵️ Deep Stealth Mode | Anti-Hash, Jitter & Metadata Strip |
+| 🔇 Stealth Audio v3.1 | Deep Audio Stealth (Phase, Spectral Jitter, Echo) |
 | 📊 Настройка силы | Слайдер 1–10 для контроля интенсивности |
 | 📦 Пакетная обработка | Загружай десятки файлов одновременно |
 | 🔍 Сравнение До/После | Side-by-side просмотр результатов |
