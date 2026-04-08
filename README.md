@@ -1,3 +1,12 @@
+---
+title: StealthMask
+emoji: 🛡️
+colorFrom: indigo
+colorTo: purple
+sdk: docker
+app_port: 7860
+---
+
 # 🛡️ StealthMask — сделай фото и видео невидимыми для ИИ
 
 StealthMask накладывает **невидимый для человека** adversarial-шум на изображения и видео,
