@@ -54,38 +54,41 @@ jobs_lock = threading.Lock()
 
 
 def _adversarial_perturbation(img_array: np.ndarray, strength: int,
-                               anti_ocr: bool, distort_scene: bool) -> np.ndarray:
+                               anti_ocr: bool, distort_scene: bool,
+                               seed: int = 0) -> np.ndarray:
     """
     Generate a multi-layer adversarial noise tensor.
-    Layers are calibrated so the result is nearly invisible to humans
-    but devastating to neural-network feature extractors.
-
-    strength: 1–10  (maps to epsilon range ~2–25 on uint8 scale)
+    seed: if provided, shifts the phase of the patterns (for video dynamic noise).
     """
     h, w = img_array.shape[:2]
     channels = img_array.shape[2] if img_array.ndim == 3 else 1
-    epsilon = 2.0 + (strength - 1) * 2.5          # 2 … 24.5
+    epsilon = 2.0 + (strength - 1) * 2.5
+
+    # Random patterns grounded by seed
+    if seed:
+        np.random.seed(seed % (2**32))
 
     noise = np.zeros_like(img_array, dtype=np.float64)
 
-    # --- Layer 1: Gaussian noise (broad-spectrum feature disruption) ---
+    # --- Layer 1: Gaussian noise ---
     gaussian = np.random.normal(0, epsilon * 0.45, img_array.shape)
     noise += gaussian
 
-    # --- Layer 2: High-frequency grid noise (breaks convolution kernels) ---
+    # --- Layer 2: High-frequency grid noise ---
     hf = np.zeros_like(img_array, dtype=np.float64)
-    # Checkerboard pattern — maximises gradient confusion
     hf[0::2, 1::2] = epsilon * 0.35
     hf[1::2, 0::2] = epsilon * 0.35
     hf[0::2, 0::2] = -epsilon * 0.35
     hf[1::2, 1::2] = -epsilon * 0.35
     noise += hf
 
-    # --- Layer 3: Sinusoidal wave (phase-shifts feature maps) ---
+    # --- Layer 3: Sinusoidal wave (with phase shift) ---
+    phase_x = (seed * 0.13) if seed else 0
+    phase_y = (seed * 0.07) if seed else 0
     y_coords = np.arange(h).reshape(-1, 1)
     x_coords = np.arange(w).reshape(1, -1)
     freq = 0.05 + strength * 0.015
-    sin_pattern = np.sin(2 * np.pi * freq * x_coords + y_coords * freq * 0.7)
+    sin_pattern = np.sin(2 * np.pi * freq * x_coords + phase_x + y_coords * freq * 0.7 + phase_y)
     sin_pattern = sin_pattern * epsilon * 0.3
     if channels > 1:
         sin_pattern = np.stack([sin_pattern] * channels, axis=-1)
@@ -93,7 +96,7 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
 
     # --- Layer 4 (anti-OCR): mid-frequency horizontal stripes ---
     if anti_ocr:
-        stripe = np.sin(2 * np.pi * y_coords * 0.12) * epsilon * 0.5
+        stripe = np.sin(2 * np.pi * y_coords * 0.12 + phase_y * 0.5) * epsilon * 0.5
         stripe_pattern = np.broadcast_to(
             stripe[:, :, np.newaxis] if channels > 1 else stripe,
             img_array.shape
@@ -102,11 +105,11 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
 
     # --- Layer 5 (scene distortion): radial gradient perturbation ---
     if distort_scene:
-        cy, cx = h / 2, w / 2
+        cy, cx = h / 2 + (seed % 10 - 5 if seed else 0), w / 2 + (seed % 14 - 7 if seed else 0)
         yy, xx = np.mgrid[0:h, 0:w]
         radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
-        max_r = np.sqrt(cy ** 2 + cx ** 2)
-        radial = np.cos(radius / max_r * np.pi * (3 + strength * 0.5))
+        max_r = np.sqrt((h/2) ** 2 + (w/2) ** 2)
+        radial = np.cos(radius / max_r * np.pi * (3 + strength * 0.5) + phase_x * 0.2)
         radial = radial * epsilon * 0.4
         if channels > 1:
             radial = np.stack([radial] * channels, axis=-1)
@@ -118,12 +121,22 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
 
 
 def process_image_file(src: Path, dst: Path, strength: int,
-                        anti_ocr: bool, distort_scene: bool):
+                        anti_ocr: bool, distort_scene: bool, deep_stealth: bool = False):
     """Load an image, apply adversarial perturbation, save."""
     img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError(f"Cannot read image: {src}")
-    processed = _adversarial_perturbation(img, strength, anti_ocr, distort_scene)
+
+    seed = np.random.randint(0, 10000) if deep_stealth else 0
+    processed = _adversarial_perturbation(img, strength, anti_ocr, distort_scene, seed=seed)
+
+    # If deep_stealth, apply a tiny random crop/zoom (pHash breaker)
+    if deep_stealth:
+        h, w = processed.shape[:2]
+        pad = int(min(h, w) * 0.005) # 0.5%
+        if pad > 0:
+            crop = processed[pad:h-pad, pad:w-pad]
+            processed = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LANCZOS4)
 
     ext = dst.suffix.lower()
     if ext in (".jpg", ".jpeg"):
@@ -194,7 +207,8 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 
 def process_video_file(src: Path, dst: Path, strength: int,
                         anti_ocr: bool, distort_scene: bool,
-                        mask_audio: bool, on_progress=None):
+                        mask_audio: bool, deep_stealth: bool = False,
+                        on_progress=None):
     """
     Process a video frame-by-frame with adversarial perturbation.
     Optionally masks the audio track too.
@@ -216,18 +230,35 @@ def process_video_file(src: Path, dst: Path, strength: int,
         frames_dir.mkdir(exist_ok=True)
 
         idx = 0
+        global_seed = np.random.randint(0, 10000) if deep_stealth else 0
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            processed = _adversarial_perturbation(frame, strength, anti_ocr, distort_scene)
+
+            # Per-frame unique seed for bit-diversity
+            frame_seed = global_seed + idx if deep_stealth else 0
+            processed = _adversarial_perturbation(frame, strength, anti_ocr, distort_scene, seed=frame_seed)
+
+            # pHash breaker: tiny random zoom/jitter per video
+            if deep_stealth and idx == 0:
+                # We apply the same tiny transformation to all frames to keep it smooth
+                jitter_val = 0.002 + (global_seed % 50) * 0.0001 # 0.2% - 0.7%
+                pad_h = int(height * jitter_val)
+                pad_w = int(width * jitter_val)
+
+            if deep_stealth:
+                crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
+                processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
             cv2.imwrite(str(frames_dir / f"{idx:08d}.png"), processed)
             idx += 1
             if on_progress and total_frames > 0:
                 on_progress(int(idx / total_frames * 90))   # 0-90% for frames
         cap.release()
 
-        # --- Reassemble video from frames (no audio) ---
+        # --- Reassemble video from frames (no audio + strip metadata) ---
         raw_video = str(tmp_dir / "video_noaudio.mp4")
         subprocess.run([
             "ffmpeg", "-y", "-framerate", str(fps),
@@ -235,6 +266,7 @@ def process_video_file(src: Path, dst: Path, strength: int,
             "-c:v", "libx264", "-preset", "fast",
             "-crf", "18", "-pix_fmt", "yuv420p",
             "-vf", f"scale={width}:{height}",
+            "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact", # Metadata strip
             raw_video
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
@@ -268,11 +300,12 @@ def _extract_audio(video_path: str, audio_path: str) -> bool:
 
 
 def _mux_video_audio(video_path: str, audio_path: str, output_path: str):
-    """Combine processed video and audio into final file."""
+    """Combine processed video and audio into final file with total metadata strip."""
     subprocess.run([
         "ffmpeg", "-y",
         "-i", video_path, "-i", audio_path,
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
         "-shortest", output_path
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
@@ -283,7 +316,8 @@ def _mux_video_audio(video_path: str, audio_path: str, output_path: str):
 
 
 def _run_job(job_id: str, files_meta: list, strength: int,
-             anti_ocr: bool, distort_scene: bool, mask_audio_flag: bool):
+             anti_ocr: bool, distort_scene: bool, mask_audio_flag: bool,
+             deep_stealth: bool):
     """Process every file in the job. Runs in a background thread."""
     job_output = OUTPUT_DIR / job_id
     job_output.mkdir(exist_ok=True)
@@ -297,13 +331,13 @@ def _run_job(job_id: str, files_meta: list, strength: int,
 
         try:
             if ext in IMAGE_EXTENSIONS:
-                process_image_file(src, dst, strength, anti_ocr, distort_scene)
+                process_image_file(src, dst, strength, anti_ocr, distort_scene, deep_stealth)
                 _update_file_status(job_id, i, "done", 100)
             elif ext in VIDEO_EXTENSIONS:
                 def progress_cb(pct, _i=i):
                     _update_file_status(job_id, _i, "processing", pct)
                 process_video_file(src, dst, strength, anti_ocr, distort_scene,
-                                   mask_audio_flag, on_progress=progress_cb)
+                                   mask_audio_flag, deep_stealth, on_progress=progress_cb)
                 _update_file_status(job_id, i, "done", 100)
             else:
                 _update_file_status(job_id, i, "error", 0)
@@ -392,10 +426,11 @@ def process(job_id: str):
     anti_ocr = bool(body.get("anti_ocr", False))
     distort_scene = bool(body.get("distort_scene", False))
     mask_audio_flag = bool(body.get("mask_audio", False))
+    deep_stealth = bool(body.get("deep_stealth", False))
 
     t = threading.Thread(
         target=_run_job,
-        args=(job_id, job["files"], strength, anti_ocr, distort_scene, mask_audio_flag),
+        args=(job_id, job["files"], strength, anti_ocr, distort_scene, mask_audio_flag, deep_stealth),
         daemon=True
     )
     t.start()

@@ -172,6 +172,7 @@ async function startProcessing() {
         anti_ocr: $("#opt-ocr").checked,
         distort_scene: $("#opt-scene").checked,
         mask_audio: $("#opt-audio").checked,
+        deep_stealth: $("#opt-deep").checked,
     };
 
     try {
