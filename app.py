@@ -120,20 +120,82 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
+def _elastic_warp(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
+    """
+    Apply low-frequency mesh distortion to break pHash and SSIM.
+    strength: 1-10
+    seed: random factor
+    """
+    rows, cols = img.shape[:2]
+    np.random.seed(seed % (2**32))
+
+    # Grid control points (low freq)
+    grid_size = 5
+    x = np.linspace(0, cols, grid_size)
+    y = np.linspace(0, rows, grid_size)
+    xv, yv = np.meshgrid(x, y)
+
+    # Random displacement
+    amp = 1.0 + strength * 0.8
+    dx = np.random.uniform(-amp, amp, xv.shape)
+    dy = np.random.uniform(-amp, amp, yv.shape)
+
+    # Upscale displacement to original size
+    from scipy.interpolate import RectBivariateSpline
+    fx = RectBivariateSpline(y, x, dx)
+    fy = RectBivariateSpline(y, x, dy)
+
+    map_x, map_y = np.meshgrid(np.arange(cols), np.arange(rows))
+    map_x = map_x.astype(np.float32) + fx(np.arange(rows), np.arange(cols)).astype(np.float32)
+    map_y = map_y.astype(np.float32) + fy(np.arange(rows), np.arange(cols)).astype(np.float32)
+
+    return cv2.remap(img, map_x, map_y, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT)
+
+
+def _chroma_attack(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
+    """
+    Attack YCbCr color space specifically.
+    """
+    # Convert to YUV (YCbCr)
+    yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    y, cr, cb = cv2.split(yuv)
+
+    np.random.seed((seed + 77) % (2**32))
+    amp = 1 + strength * 0.5
+
+    # Apply noise to Chroma channels only (Cb, Cr)
+    # Most AIs focus on Luma (Y) features
+    noise_cr = np.random.normal(0, amp, cr.shape).astype(np.int16)
+    noise_cb = np.random.normal(0, amp, cb.shape).astype(np.int16)
+
+    cr = np.clip(cr.astype(np.int16) + noise_cr, 0, 255).astype(np.uint8)
+    cb = np.clip(cb.astype(np.int16) + noise_cb, 0, 255).astype(np.uint8)
+
+    yuv_p = cv2.merge([y, cr, cb])
+    return cv2.cvtColor(yuv_p, cv2.COLOR_YCrCb2BGR)
+
+
 def process_image_file(src: Path, dst: Path, strength: int,
-                        anti_ocr: bool, distort_scene: bool, deep_stealth: bool = False):
+                        anti_ocr: bool, distort_scene: bool,
+                        deep_stealth: bool = False, v3: bool = False):
     """Load an image, apply adversarial perturbation, save."""
     img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError(f"Cannot read image: {src}")
 
-    seed = np.random.randint(0, 10000) if deep_stealth else 0
+    seed = np.random.randint(0, 10000) if (deep_stealth or v3) else 0
+
+    # v3 Neural Warp
+    if v3:
+        img = _elastic_warp(img, strength, seed)
+        img = _chroma_attack(img, strength, seed)
+
     processed = _adversarial_perturbation(img, strength, anti_ocr, distort_scene, seed=seed)
 
-    # If deep_stealth, apply a tiny random crop/zoom (pHash breaker)
-    if deep_stealth:
+    # pHash breaker (zoom)
+    if deep_stealth or v3:
         h, w = processed.shape[:2]
-        pad = int(min(h, w) * 0.005) # 0.5%
+        pad = int(min(h, w) * 0.006)
         if pad > 0:
             crop = processed[pad:h-pad, pad:w-pad]
             processed = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LANCZOS4)
@@ -208,11 +270,11 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 def process_video_file(src: Path, dst: Path, strength: int,
                         anti_ocr: bool, distort_scene: bool,
                         mask_audio: bool, deep_stealth: bool = False,
+                        v3: bool = False,
                         on_progress=None):
     """
-    Process a video frame-by-frame with adversarial perturbation.
-    Optionally masks the audio track too.
-    Uses subprocess + ffmpeg for muxing to preserve quality.
+    Process a video frame-by-frame with adversarial perturbation + metadata strip.
+    v3 adds Neural Warp and Chroma Attack.
     """
     tmp_dir = dst.parent / f"_tmp_{dst.stem}"
     tmp_dir.mkdir(exist_ok=True)
@@ -230,35 +292,41 @@ def process_video_file(src: Path, dst: Path, strength: int,
         frames_dir.mkdir(exist_ok=True)
 
         idx = 0
-        global_seed = np.random.randint(0, 10000) if deep_stealth else 0
+        global_seed = np.random.randint(0, 10000) if (deep_stealth or v3) else 0
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Per-frame unique seed for bit-diversity
-            frame_seed = global_seed + idx if deep_stealth else 0
+            # Per-frame unique seed
+            frame_seed = global_seed + idx if (deep_stealth or v3) else 0
+
+            # v3 Neural Warp (Dynamic Warp)
+            if v3:
+                # Add per-frame drift to the warp
+                frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
+                frame = _chroma_attack(frame, strength, frame_seed)
+
             processed = _adversarial_perturbation(frame, strength, anti_ocr, distort_scene, seed=frame_seed)
 
-            # pHash breaker: tiny random zoom/jitter per video
-            if deep_stealth and idx == 0:
-                # We apply the same tiny transformation to all frames to keep it smooth
-                jitter_val = 0.002 + (global_seed % 50) * 0.0001 # 0.2% - 0.7%
+            # pHash breaker: tiny random zoom/jitter
+            if (deep_stealth or v3) and idx == 0:
+                jitter_val = 0.003 + (global_seed % 50) * 0.0001
                 pad_h = int(height * jitter_val)
                 pad_w = int(width * jitter_val)
 
-            if deep_stealth:
+            if deep_stealth or v3:
                 crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
                 processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
 
             cv2.imwrite(str(frames_dir / f"{idx:08d}.png"), processed)
             idx += 1
             if on_progress and total_frames > 0:
-                on_progress(int(idx / total_frames * 90))   # 0-90% for frames
+                on_progress(int(idx / total_frames * 90))
         cap.release()
 
-        # --- Reassemble video from frames (no audio + strip metadata) ---
+        # --- Reassemble video from frames ---
         raw_video = str(tmp_dir / "video_noaudio.mp4")
         subprocess.run([
             "ffmpeg", "-y", "-framerate", str(fps),
@@ -266,20 +334,33 @@ def process_video_file(src: Path, dst: Path, strength: int,
             "-c:v", "libx264", "-preset", "fast",
             "-crf", "18", "-pix_fmt", "yuv420p",
             "-vf", f"scale={width}:{height}",
-            "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact", # Metadata strip
+            "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact",
             raw_video
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        # --- Handle audio ---
+        # --- Handle audio (v3 adds pitch jitter) ---
         audio_tmp = str(tmp_dir / "audio.wav")
         has_audio = _extract_audio(str(src), audio_tmp)
 
-        if has_audio and mask_audio:
-            masked_audio = str(tmp_dir / "audio_masked.wav")
-            _mask_audio(audio_tmp, masked_audio, strength)
-            _mux_video_audio(raw_video, masked_audio, str(dst))
-        elif has_audio:
-            _mux_video_audio(raw_video, audio_tmp, str(dst))
+        if has_audio:
+            final_audio = audio_tmp
+            if mask_audio:
+                masked_audio = str(tmp_dir / "audio_masked.wav")
+                _mask_audio(audio_tmp, masked_audio, strength)
+                final_audio = masked_audio
+
+            # v3 Audio Jitter (Pitch shift)
+            if v3:
+                jitter_audio = str(tmp_dir / "audio_jitter.wav")
+                pitch = 0.99 + (global_seed % 20) * 0.001 # 0.99 - 1.01
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", final_audio,
+                    "-af", f"asetrate=44100*{pitch},aresample=44100",
+                    jitter_audio
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                final_audio = jitter_audio
+
+            _mux_video_audio(raw_video, final_audio, str(dst))
         else:
             shutil.copy2(raw_video, str(dst))
 
@@ -317,7 +398,7 @@ def _mux_video_audio(video_path: str, audio_path: str, output_path: str):
 
 def _run_job(job_id: str, files_meta: list, strength: int,
              anti_ocr: bool, distort_scene: bool, mask_audio_flag: bool,
-             deep_stealth: bool):
+             deep_stealth: bool, v3: bool):
     """Process every file in the job. Runs in a background thread."""
     job_output = OUTPUT_DIR / job_id
     job_output.mkdir(exist_ok=True)
@@ -331,13 +412,13 @@ def _run_job(job_id: str, files_meta: list, strength: int,
 
         try:
             if ext in IMAGE_EXTENSIONS:
-                process_image_file(src, dst, strength, anti_ocr, distort_scene, deep_stealth)
+                process_image_file(src, dst, strength, anti_ocr, distort_scene, deep_stealth, v3)
                 _update_file_status(job_id, i, "done", 100)
             elif ext in VIDEO_EXTENSIONS:
                 def progress_cb(pct, _i=i):
                     _update_file_status(job_id, _i, "processing", pct)
                 process_video_file(src, dst, strength, anti_ocr, distort_scene,
-                                   mask_audio_flag, deep_stealth, on_progress=progress_cb)
+                                   mask_audio_flag, deep_stealth, v3, on_progress=progress_cb)
                 _update_file_status(job_id, i, "done", 100)
             else:
                 _update_file_status(job_id, i, "error", 0)
@@ -427,10 +508,11 @@ def process(job_id: str):
     distort_scene = bool(body.get("distort_scene", False))
     mask_audio_flag = bool(body.get("mask_audio", False))
     deep_stealth = bool(body.get("deep_stealth", False))
+    v3 = bool(body.get("v3", False))
 
     t = threading.Thread(
         target=_run_job,
-        args=(job_id, job["files"], strength, anti_ocr, distort_scene, mask_audio_flag, deep_stealth),
+        args=(job_id, job["files"], strength, anti_ocr, distort_scene, mask_audio_flag, deep_stealth, v3),
         daemon=True
     )
     t.start()
