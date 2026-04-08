@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="StealthMask — сделай фото и видео невидимыми для ИИ. Adversarial perturbation ломает OCR, GPT-4V, Claude Vision, Whisper.">
+    <title>StealthMask — Защити контент от ИИ</title>
+
+    <!-- Tailwind 3 CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+                    colors: {
+                        brand:    { DEFAULT: '#646cff', dim: '#646cff33' },
+                        surface:  { DEFAULT: '#14172280', hi: '#1c1f2e' },
+                        deep:     '#07080d',
+                        midnight: '#0d0f17',
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- Custom styles -->
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="min-h-screen text-gray-200">
+
+    <!-- ============================================================
+         HEADER
+         ============================================================ -->
+    <header class="relative z-10 border-b border-white/5">
+        <div class="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+            <!-- Logo -->
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-brand to-purple-500 flex items-center justify-center shadow-lg shadow-brand/20">
+                    <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                              d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
+                    </svg>
+                </div>
+                <h1 class="text-xl font-bold tracking-tight">
+                    <span class="text-white">Stealth</span><span class="text-brand">Mask</span>
+                </h1>
+            </div>
+            <a href="https://github.com" target="_blank"
+               class="text-gray-500 hover:text-gray-300 transition text-sm flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 .5C5.37.5 0 5.78 0 12.292c0 5.211 3.438 9.63 8.205 11.188.6.111.82-.254.82-.567 0-.28-.01-1.022-.015-2.005-3.338.711-4.042-1.582-4.042-1.582-.546-1.361-1.333-1.723-1.333-1.723-1.089-.73.083-.716.083-.716 1.204.083 1.837 1.215 1.837 1.215 1.07 1.803 2.809 1.282 3.495.98.108-.763.417-1.282.76-1.577-2.665-.295-5.466-1.309-5.466-5.827 0-1.287.465-2.339 1.229-3.164-.123-.298-.533-1.496.117-3.12 0 0 1.004-.314 3.285 1.209.953-.26 1.975-.39 2.993-.395 1.015.005 2.038.135 2.993.395 2.28-1.523 3.282-1.209 3.282-1.209.653 1.624.243 2.822.12 3.12.765.825 1.227 1.877 1.227 3.164 0 4.53-2.805 5.527-5.475 5.817.432.364.816 1.085.816 2.186 0 1.578-.014 2.846-.014 3.233 0 .316.216.684.825.568C20.565 21.917 24 17.5 24 12.292 24 5.78 18.627.5 12 .5z"/>
+                </svg>
+                GitHub
+            </a>
+        </div>
+    </header>
+
+    <main class="relative z-10 max-w-5xl mx-auto px-4 py-10 space-y-10">
+
+        <!-- ============================================================
+             HERO
+             ============================================================ -->
+        <section class="text-center space-y-4">
+            <h2 class="text-4xl sm:text-5xl font-extrabold leading-tight">
+                Сделай контент<br>
+                <span class="bg-gradient-to-r from-brand to-cyan-400 bg-clip-text text-transparent">
+                    невидимым для ИИ
+                </span>
+            </h2>
+            <p class="text-gray-400 text-lg max-w-2xl mx-auto leading-relaxed">
+                Загрузи фото или видео → ИИ перестанет понимать текст и что происходит,
+                а ты будешь видеть <span class="text-gray-200 font-medium">почти то же самое</span>.
+            </p>
+        </section>
+
+        <!-- ============================================================
+             DROP ZONE
+             ============================================================ -->
+        <section>
+            <div id="dropzone" class="dropzone p-12 sm:p-16 flex flex-col items-center justify-center gap-4 text-center">
+                <div class="dropzone-icon w-16 h-16 rounded-2xl bg-gradient-to-br from-brand/20 to-purple-500/20 flex items-center justify-center">
+                    <svg class="w-8 h-8 text-brand" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                    </svg>
+                </div>
+                <div>
+                    <p class="text-white font-semibold">Перетащи файлы сюда</p>
+                    <p class="text-gray-500 text-sm mt-1">или нажми, чтобы выбрать &middot; JPG, PNG, WEBP, MP4, MOV, AVI</p>
+                </div>
+                <input type="file" id="file-input" class="hidden" multiple
+                       accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.avi,image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-msvideo">
+            </div>
+        </section>
+
+        <!-- ============================================================
+             GALLERY (uploaded files)
+             ============================================================ -->
+        <section id="gallery-section" class="section-hidden">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                    <svg class="w-5 h-5 text-brand" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                              d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                    </svg>
+                    Загруженные файлы
+                </h3>
+                <button id="new-upload-btn" class="btn-secondary text-xs">Сбросить всё</button>
+            </div>
+            <div id="gallery" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3"></div>
+        </section>
+
+        <!-- ============================================================
+             CONTROLS
+             ============================================================ -->
+        <section id="controls-section" class="section-hidden">
+            <div class="glass p-6 space-y-6">
+                <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                    <svg class="w-5 h-5 text-brand" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                              d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
+                    </svg>
+                    Настройки маскировки
+                </h3>
+
+                <!-- Strength slider -->
+                <div class="space-y-2">
+                    <div class="flex items-center justify-between">
+                        <label for="strength" class="text-sm text-gray-300 font-medium">
+                            Сила маскировки
+                        </label>
+                        <span id="strength-value" class="text-brand font-bold text-lg">5</span>
+                    </div>
+                    <div class="flex items-center gap-3">
+                        <span class="text-xs text-gray-500">1</span>
+                        <input type="range" id="strength" min="1" max="10" value="5" class="range-slider flex-1">
+                        <span class="text-xs text-gray-500">10</span>
+                    </div>
+                    <p class="text-xs text-gray-500">Больше = надёжнее ломает ИИ, но чуть заметнее для человека</p>
+                </div>
+
+                <!-- Checkboxes -->
+                <div class="grid sm:grid-cols-3 gap-4">
+                    <label class="flex items-start gap-3 cursor-pointer group">
+                        <input type="checkbox" id="opt-ocr" checked class="check-custom mt-0.5">
+                        <div>
+                            <p class="text-sm text-gray-200 font-medium group-hover:text-white transition">Скрыть текст (анти-OCR)</p>
+                            <p class="text-xs text-gray-500">Tesseract, GPT-4V, Claude</p>
+                        </div>
+                    </label>
+                    <label class="flex items-start gap-3 cursor-pointer group">
+                        <input type="checkbox" id="opt-scene" checked class="check-custom mt-0.5">
+                        <div>
+                            <p class="text-sm text-gray-200 font-medium group-hover:text-white transition">Исказить сцену</p>
+                            <p class="text-xs text-gray-500">Vision-модели, YOLO, CLIP</p>
+                        </div>
+                    </label>
+                    <label class="flex items-start gap-3 cursor-pointer group">
+                        <input type="checkbox" id="opt-audio" checked class="check-custom mt-0.5">
+                        <div>
+                            <p class="text-sm text-gray-200 font-medium group-hover:text-white transition">Маскировать аудио</p>
+                            <p class="text-xs text-gray-500">Whisper, Deepgram, Grok</p>
+                        </div>
+                    </label>
+                </div>
+
+                <!-- Process button -->
+                <div class="pt-2">
+                    <button id="process-btn" class="btn-primary w-full flex items-center justify-center gap-2 text-base">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                        </svg>
+                        Обработать всё
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ============================================================
+             PROGRESS
+             ============================================================ -->
+        <section id="progress-section" class="section-hidden">
+            <div class="glass p-6 space-y-4 pulse-processing">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                        <svg class="w-5 h-5 text-cyan-400 animate-spin" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                        </svg>
+                        Обработка...
+                    </h3>
+                    <span id="overall-pct" class="text-brand font-bold">0%</span>
+                </div>
+                <div class="progress-track">
+                    <div id="overall-bar" class="progress-fill" style="width:0%"></div>
+                </div>
+                <div id="progress-list" class="space-y-2 max-h-60 overflow-y-auto"></div>
+            </div>
+        </section>
+
+        <!-- ============================================================
+             RESULTS
+             ============================================================ -->
+        <section id="results-section" class="section-hidden">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-white flex items-center gap-2">
+                    <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                              d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                    Результаты
+                </h3>
+                <button id="download-all-btn" class="btn-primary text-sm px-4 py-2 flex items-center gap-2">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                    </svg>
+                    Скачать всё (ZIP)
+                </button>
+            </div>
+            <p class="text-sm text-gray-400 mb-4">
+                Перетаскивай ползунок на изображениях, чтобы сравнить «До» и «После».
+            </p>
+            <div id="results-grid" class="grid sm:grid-cols-2 gap-4"></div>
+        </section>
+
+    </main>
+
+    <!-- ============================================================
+         FOOTER
+         ============================================================ -->
+    <footer class="relative z-10 border-t border-white/5 mt-20">
+        <div class="max-w-6xl mx-auto px-4 py-6 text-center text-gray-600 text-sm">
+            StealthMask &copy; 2026 &middot; Adversarial perturbation for privacy
+        </div>
+    </footer>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

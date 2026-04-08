@@ -1,0 +1,9 @@
+flask
+pillow
+numpy
+opencv-python
+moviepy
+pydub
+scipy
+soundfile
+python-dotenv

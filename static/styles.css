@@ -1,0 +1,319 @@
+/* ============================================================
+   StealthMask — Custom Styles
+   Dark theme augmenting Tailwind utilities
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+/* ---------- Base ---------- */
+:root {
+    --clr-bg-deep:    #07080d;
+    --clr-bg:         #0d0f17;
+    --clr-surface:    #14172280;
+    --clr-surface-hi: #1c1f2e;
+    --clr-border:     #23283a;
+    --clr-accent:     #646cff;
+    --clr-accent-dim: #646cff33;
+    --clr-cyan:       #00e5ff;
+    --clr-cyan-dim:   #00e5ff22;
+    --clr-success:    #10b981;
+    --clr-warn:       #f59e0b;
+    --clr-error:      #ef4444;
+    --clr-text:       #e2e8f0;
+    --clr-text-dim:   #64748b;
+    --radius-lg:      1rem;
+    --radius-md:      0.625rem;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background: var(--clr-bg-deep);
+    color: var(--clr-text);
+    min-height: 100vh;
+    overflow-x: hidden;
+}
+
+/* Subtle animated gradient on body */
+body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background:
+        radial-gradient(ellipse 60% 50% at 20% 10%, #646cff0d 0%, transparent 70%),
+        radial-gradient(ellipse 50% 40% at 80% 90%, #00e5ff0a 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+}
+
+/* ---------- Glass card ---------- */
+.glass {
+    background: var(--clr-surface);
+    backdrop-filter: blur(16px) saturate(1.2);
+    -webkit-backdrop-filter: blur(16px) saturate(1.2);
+    border: 1px solid var(--clr-border);
+    border-radius: var(--radius-lg);
+}
+
+/* ---------- Drop zone ---------- */
+.dropzone {
+    position: relative;
+    border: 2px dashed var(--clr-border);
+    border-radius: var(--radius-lg);
+    transition: all 0.3s ease;
+    cursor: pointer;
+    background: var(--clr-surface);
+}
+.dropzone:hover,
+.dropzone.drag-over {
+    border-color: var(--clr-accent);
+    background: var(--clr-accent-dim);
+    box-shadow: 0 0 40px var(--clr-accent-dim);
+}
+.dropzone.drag-over .dropzone-icon {
+    transform: scale(1.15);
+}
+.dropzone-icon {
+    transition: transform 0.3s ease;
+}
+
+/* ---------- Gallery ---------- */
+.gallery-item {
+    position: relative;
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    background: var(--clr-bg);
+    border: 1px solid var(--clr-border);
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+.gallery-item:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+}
+.gallery-item img,
+.gallery-item video {
+    width: 100%;
+    height: 160px;
+    object-fit: cover;
+}
+.gallery-remove {
+    position: absolute; top: 6px; right: 6px;
+    width: 26px; height: 26px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%;
+    background: rgba(0,0,0,.65);
+    color: #fff;
+    font-size: 14px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity .2s, background .2s;
+}
+.gallery-item:hover .gallery-remove { opacity: 1; }
+.gallery-remove:hover { background: var(--clr-error); }
+
+/* ---------- Controls ---------- */
+.range-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--clr-border);
+    outline: none;
+}
+.range-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: var(--clr-accent);
+    cursor: grab;
+    box-shadow: 0 0 12px var(--clr-accent-dim);
+    transition: transform .15s;
+}
+.range-slider::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+}
+.range-slider::-moz-range-thumb {
+    width: 22px; height: 22px;
+    border: none;
+    border-radius: 50%;
+    background: var(--clr-accent);
+    cursor: grab;
+}
+
+/* Checkbox custom */
+.check-custom {
+    accent-color: var(--clr-accent);
+    width: 18px; height: 18px;
+    cursor: pointer;
+}
+
+/* ---------- Buttons ---------- */
+.btn-primary {
+    background: linear-gradient(135deg, var(--clr-accent), #8b5cf6);
+    color: #fff;
+    font-weight: 600;
+    padding: 0.75rem 2rem;
+    border: none;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: transform .15s, box-shadow .2s, opacity .2s;
+    font-size: 0.95rem;
+}
+.btn-primary:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 24px #646cff44;
+}
+.btn-primary:disabled {
+    opacity: .45;
+    cursor: not-allowed;
+}
+.btn-secondary {
+    background: var(--clr-surface-hi);
+    color: var(--clr-text);
+    font-weight: 500;
+    padding: 0.6rem 1.4rem;
+    border: 1px solid var(--clr-border);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background .2s, border-color .2s;
+    font-size: 0.85rem;
+}
+.btn-secondary:hover {
+    background: var(--clr-border);
+    border-color: var(--clr-accent);
+}
+
+/* ---------- Progress bars ---------- */
+.progress-track {
+    width: 100%;
+    height: 6px;
+    background: var(--clr-border);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.progress-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--clr-accent), var(--clr-cyan));
+    transition: width 0.4s ease;
+}
+
+/* ---------- Compare slider ---------- */
+.compare-container {
+    position: relative;
+    overflow: hidden;
+    border-radius: var(--radius-md);
+    border: 1px solid var(--clr-border);
+    user-select: none;
+    cursor: ew-resize;
+}
+.compare-container img,
+.compare-container video {
+    display: block;
+    width: 100%;
+    pointer-events: none;
+}
+.compare-after {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    overflow: hidden;
+}
+.compare-handle {
+    position: absolute; top: 0; bottom: 0;
+    width: 3px;
+    background: var(--clr-accent);
+    box-shadow: 0 0 12px var(--clr-accent-dim);
+    z-index: 10;
+}
+.compare-handle::after {
+    content: '⟺';
+    position: absolute; top: 50%;
+    left: 50%; transform: translate(-50%, -50%);
+    width: 32px; height: 32px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%;
+    background: var(--clr-accent);
+    color: #fff;
+    font-size: 14px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.5);
+}
+
+.compare-label {
+    position: absolute; top: 10px;
+    padding: 3px 10px;
+    border-radius: 4px;
+    background: rgba(0,0,0,.6);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .5px;
+    z-index: 5;
+}
+.compare-label-before { left: 10px; }
+.compare-label-after  { right: 10px; }
+
+/* ---------- Toast / notification ---------- */
+.toast {
+    position: fixed; top: 24px; right: 24px;
+    padding: 12px 20px;
+    border-radius: var(--radius-md);
+    background: var(--clr-surface-hi);
+    border: 1px solid var(--clr-border);
+    color: var(--clr-text);
+    font-size: 14px;
+    z-index: 999;
+    animation: toast-in .3s ease;
+    box-shadow: 0 8px 32px rgba(0,0,0,.3);
+}
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(-12px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ---------- File status badges ---------- */
+.badge { 
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 8px; border-radius: 99px;
+    font-size: 11px; font-weight: 600; letter-spacing: .3px;
+    text-transform: uppercase;
+}
+.badge-pending  { background: #334155; color: #94a3b8; }
+.badge-processing { background: #1e3a5f; color: #38bdf8; }
+.badge-done     { background: #064e3b; color: #34d399; }
+.badge-error    { background: #450a0a; color: #f87171; }
+
+/* ---------- Section transitions ---------- */
+.section-hidden {
+    display: none;
+    opacity: 0;
+    transform: translateY(12px);
+}
+.section-visible {
+    display: block;
+    opacity: 1;
+    transform: translateY(0);
+    animation: fade-up .4s ease;
+}
+@keyframes fade-up {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ---------- Pulse animation for processing ---------- */
+@keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 0 0 var(--clr-accent-dim); }
+    50%      { box-shadow: 0 0 20px 4px var(--clr-accent-dim); }
+}
+.pulse-processing {
+    animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 640px) {
+    .gallery-item img, .gallery-item video {
+        height: 120px;
+    }
+}
