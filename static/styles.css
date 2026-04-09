@@ -150,6 +150,84 @@ body::before {
     cursor: pointer;
 }
 
+/* ---------- Profile Cards ---------- */
+.profile-card {
+    position: relative;
+    padding: 1rem;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 1rem;
+    cursor: pointer;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    overflow: hidden;
+    user-select: none;
+}
+.profile-card:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.2);
+    transform: translateY(-2px);
+}
+.profile-card.active {
+    background: rgba(100, 108, 255, 0.1);
+    border-color: var(--clr-accent);
+    box-shadow: 0 0 20px rgba(100, 108, 255, 0.15);
+}
+.profile-card[data-profile="tt_ads"].active {
+    border-color: var(--clr-accent);
+    box-shadow: 0 0 20px rgba(100, 108, 255, 0.2);
+}
+/* Specialized glow for different profiles */
+.profile-card[data-profile="invisible"].active { border-color: #06b6d4; box-shadow: 0 0 20px rgba(6, 182, 212, 0.2); }
+.profile-card[data-profile="ghost"].active { border-color: #a855f7; box-shadow: 0 0 20px rgba(168, 85, 247, 0.2); }
+
+.profile-icon {
+    width: 42px; height: 42px;
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.25rem;
+    flex-shrink: 0;
+}
+.active-badge {
+    position: absolute; top: 12px; right: 12px;
+    width: 20px; height: 20px;
+    background: var(--clr-accent);
+    color: white;
+    border-radius: 50%;
+    font-size: 10px;
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0;
+    transform: scale(0.5);
+    transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.profile-card.active .active-badge {
+    opacity: 1;
+    transform: scale(1);
+}
+
+.slider-custom {
+    -webkit-appearance: none;
+    width: 100%;
+    height: 8px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 10px;
+    outline: none;
+}
+.slider-custom::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 24px; height: 24px;
+    background: var(--clr-accent);
+    border-radius: 50%;
+    cursor: pointer;
+    box-shadow: 0 0 10px rgba(100,108,255,0.4);
+    transition: transform 0.1s;
+}
+.slider-custom::-webkit-slider-thumb:active {
+    transform: scale(1.2);
+}
+
 /* ---------- Buttons ---------- */
 .btn-primary {
     background: linear-gradient(135deg, var(--clr-accent), #8b5cf6);

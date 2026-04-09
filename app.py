@@ -175,25 +175,44 @@ def _chroma_attack(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     return cv2.cvtColor(yuv_p, cv2.COLOR_YCrCb2BGR)
 
 
-def process_image_file(src: Path, dst: Path, strength: int,
-                        anti_ocr: bool, distort_scene: bool,
-                        deep_stealth: bool = False, v3: bool = False):
-    """Load an image, apply adversarial perturbation, save."""
+def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom_flags: dict = None):
+    """Load an image, apply adversarial perturbation based on profile, save."""
     img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError(f"Cannot read image: {src}")
 
-    seed = np.random.randint(0, 10000) if (deep_stealth or v3) else 0
+    # Default profile settings
+    settings = {
+        "warp": profile in ("tt_ads", "ghost"),
+        "chroma": profile in ("tt_ads", "ghost"),
+        "anti_ocr": profile in ("tt_ads",),
+        "distort_scene": profile in ("tt_ads", "ghost"),
+        "v4_semantic": profile in ("tt_ads", "invisible"),
+        "deep_stealth": profile in ("tt_ads", "ghost")
+    }
+    # Override with custom flags if provided
+    if custom_flags:
+        settings.update(custom_flags)
+
+    seed = np.random.randint(0, 10000)
 
     # v3 Neural Warp
-    if v3:
+    if settings["warp"]:
         img = _elastic_warp(img, strength, seed)
+    
+    # v4 Chroma Attack
+    if settings["chroma"]:
         img = _chroma_attack(img, strength, seed)
 
-    processed = _adversarial_perturbation(img, strength, anti_ocr, distort_scene, seed=seed)
+    processed = _adversarial_perturbation(
+        img, strength, 
+        settings["anti_ocr"], 
+        settings["distort_scene"], 
+        seed=seed
+    )
 
-    # pHash breaker (zoom)
-    if deep_stealth or v3:
+    # v2/v4 pHash breaker (zoom)
+    if settings["deep_stealth"] or settings["v4_semantic"]:
         h, w = processed.shape[:2]
         pad = int(min(h, w) * 0.006)
         if pad > 0:
@@ -267,57 +286,67 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 # ---------------------------------------------------------------------------
 
 
-def process_video_file(src: Path, dst: Path, strength: int,
-                        anti_ocr: bool, distort_scene: bool,
-                        mask_audio: bool, deep_stealth: bool = False,
-                        v3: bool = False, audio_stealth: bool = False,
-                        on_progress=None):
+def process_video_file(src: Path, dst: Path, strength: int, profile: str, 
+                        custom_flags: dict = None, on_progress=None):
     """
-    Process a video frame-by-frame with adversarial perturbation + metadata strip.
-    v3 adds Neural Warp and Chroma Attack.
-    v3.1 adds Audio Deep Stealth.
+    Process a video using smart profiles. 
+    v5.0 Unified Engine.
     """
     tmp_dir = dst.parent / f"_tmp_{dst.stem}"
     tmp_dir.mkdir(exist_ok=True)
 
+    # Default profile settings
+    settings = {
+        "warp": profile in ("tt_ads", "ghost"),
+        "chroma": profile in ("tt_ads", "ghost"),
+        "anti_ocr": profile in ("tt_ads",),
+        "distort_scene": profile in ("tt_ads", "ghost"),
+        "mask_audio": profile in ("tt_ads", "ghost"),
+        "audio_stealth": profile in ("tt_ads",),
+        "v4_semantic": profile in ("tt_ads", "invisible"),
+        "deep_stealth": profile in ("tt_ads", "ghost"),
+        "metadata_strip": True
+    }
+    if custom_flags:
+        settings.update(custom_flags)
+
     try:
-        # --- Extract info ---
         cap = cv2.VideoCapture(str(src))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # --- Process frames ---
         frames_dir = tmp_dir / "frames"
         frames_dir.mkdir(exist_ok=True)
 
         idx = 0
-        global_seed = np.random.randint(0, 10000) if (deep_stealth or v3) else 0
+        global_seed = np.random.randint(0, 10000)
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Per-frame unique seed
-            frame_seed = global_seed + idx if (deep_stealth or v3) else 0
-
-            # v3 Neural Warp (Dynamic Warp)
-            if v3:
-                # Add per-frame drift to the warp
+            seed = global_seed + idx
+            
+            if settings["warp"]:
                 frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
-                frame = _chroma_attack(frame, strength, frame_seed)
+            
+            if settings["chroma"]:
+                frame = _chroma_attack(frame, strength, seed)
 
-            processed = _adversarial_perturbation(frame, strength, anti_ocr, distort_scene, seed=frame_seed)
+            processed = _adversarial_perturbation(
+                frame, strength, 
+                settings["anti_ocr"], 
+                settings["distort_scene"], 
+                seed=seed
+            )
 
-            # pHash breaker: tiny random zoom/jitter
-            if (deep_stealth or v3) and idx == 0:
-                jitter_val = 0.003 + (global_seed % 50) * 0.0001
-                pad_h = int(height * jitter_val)
-                pad_w = int(width * jitter_val)
-
-            if deep_stealth or v3:
+            if settings["deep_stealth"] or settings["v4_semantic"]:
+                if idx == 0:
+                    jitter = 0.003 + (global_seed % 50) * 0.0001
+                    pad_h, pad_w = int(height * jitter), int(width * jitter)
                 crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
                 processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
 
@@ -327,67 +356,55 @@ def process_video_file(src: Path, dst: Path, strength: int,
                 on_progress(int(idx / total_frames * 90))
         cap.release()
 
-        # --- Reassemble video from frames ---
+        # --- Reassemble ---
         raw_video = str(tmp_dir / "video_noaudio.mp4")
-        subprocess.run([
+        mux_args = [
             "ffmpeg", "-y", "-framerate", str(fps),
             "-i", str(frames_dir / "%08d.png"),
             "-c:v", "libx264", "-preset", "fast",
             "-crf", "18", "-pix_fmt", "yuv420p",
-            "-vf", f"scale={width}:{height}",
-            "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact",
-            raw_video
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            "-vf", f"scale={width}:{height}"
+        ]
+        if settings["metadata_strip"]:
+            mux_args += ["-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact"]
+        
+        mux_args.append(raw_video)
+        subprocess.run(mux_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        # --- Handle audio (v3 adds pitch jitter) ---
+        # --- Audio ---
         audio_tmp = str(tmp_dir / "audio.wav")
         has_audio = _extract_audio(str(src), audio_tmp)
 
         if has_audio:
             final_audio = audio_tmp
-            if mask_audio:
-                masked_audio = str(tmp_dir / "audio_masked.wav")
-                _mask_audio(audio_tmp, masked_audio, strength)
-                final_audio = masked_audio
+            if settings["mask_audio"]:
+                masked = str(tmp_dir / "audio_mask.wav")
+                _mask_audio(audio_tmp, masked, strength)
+                final_audio = masked
 
-            # v3.1 Audio Deep Stealth (Phase & Spectral Attack)
-            if audio_stealth:
-                stealth_audio = str(tmp_dir / "audio_stealth.wav")
-                # Advanced filters:
-                # - aphaser: phase distortion
-                # - aecho: spectral smearing
-                # - tremolo: irregular LFO amplitude
-                # - vibrato: irregular LFO pitch
+            if settings["audio_stealth"]:
+                stealth = str(tmp_dir / "audio_stealth.wav")
                 filters = [
                     f"aphaser=in_gain=0.6:out_gain=0.8:delay=3:speed=1:type=t",
                     f"aecho=0.8:0.88:30:0.4",
                     f"tremolo=f=4:d=0.3",
                     f"vibrato=f=2:d=0.2"
                 ]
+                # Pitch jitter
+                pitch = 0.99 + (global_seed % 20) * 0.001
+                filters.append(f"asetrate=44100*{pitch},aresample=44100")
+                
                 subprocess.run([
-                    "ffmpeg", "-y", "-i", final_audio,
-                    "-af", ",".join(filters),
-                    stealth_audio
+                    "ffmpeg", "-y", "-i", final_audio, 
+                    "-af", ",".join(filters), stealth
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                final_audio = stealth_audio
-
-            # v3 Audio Jitter (Pitch shift)
-            if v3:
-                jitter_audio = str(tmp_dir / "audio_jitter.wav")
-                pitch = 0.99 + (global_seed % 20) * 0.001 # 0.99 - 1.01
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", final_audio,
-                    "-af", f"asetrate=44100*{pitch},aresample=44100",
-                    jitter_audio
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                final_audio = jitter_audio
+                final_audio = stealth
 
             _mux_video_audio(raw_video, final_audio, str(dst))
         else:
             shutil.copy2(raw_video, str(dst))
 
-        if on_progress:
-            on_progress(100)
+        if on_progress: on_progress(100)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -418,9 +435,7 @@ def _mux_video_audio(video_path: str, audio_path: str, output_path: str):
 # ---------------------------------------------------------------------------
 
 
-def _run_job(job_id: str, files_meta: list, strength: int,
-             anti_ocr: bool, distort_scene: bool, mask_audio_flag: bool,
-             deep_stealth: bool, v3: bool, audio_stealth: bool):
+def _run_job_v5(job_id: str, files_meta: list, strength: int, profile: str, custom_flags: dict):
     """Process every file in the job. Runs in a background thread."""
     job_output = OUTPUT_DIR / job_id
     job_output.mkdir(exist_ok=True)
@@ -429,19 +444,16 @@ def _run_job(job_id: str, files_meta: list, strength: int,
         _update_file_status(job_id, i, "processing", 0)
         src = UPLOAD_DIR / job_id / fm["stored_name"]
         ext = Path(fm["original_name"]).suffix.lower()
-        out_stem = Path(fm["original_name"]).stem + "_stealthmasked"
-        dst = job_output / (out_stem + ext)
+        dst = job_output / (Path(fm["original_name"]).stem + "_stealthmasked" + ext)
 
         try:
             if ext in IMAGE_EXTENSIONS:
-                process_image_file(src, dst, strength, anti_ocr, distort_scene, deep_stealth, v3)
+                process_image_file(src, dst, strength, profile, custom_flags)
                 _update_file_status(job_id, i, "done", 100)
             elif ext in VIDEO_EXTENSIONS:
                 def progress_cb(pct, _i=i):
                     _update_file_status(job_id, _i, "processing", pct)
-                process_video_file(src, dst, strength, anti_ocr, distort_scene,
-                                   mask_audio_flag, deep_stealth, v3, audio_stealth,
-                                   on_progress=progress_cb)
+                process_video_file(src, dst, strength, profile, custom_flags, on_progress=progress_cb)
                 _update_file_status(job_id, i, "done", 100)
             else:
                 _update_file_status(job_id, i, "error", 0)
@@ -450,69 +462,8 @@ def _run_job(job_id: str, files_meta: list, strength: int,
             _update_file_status(job_id, i, "error", 0)
 
     with jobs_lock:
-        jobs[job_id]["status"] = "done"
-
-
-def _update_file_status(job_id: str, file_idx: int, status: str, progress: int):
-    with jobs_lock:
-        jobs[job_id]["files"][file_idx]["status"] = status
-        jobs[job_id]["files"][file_idx]["progress"] = progress
-        # Recalculate overall progress
-        total = sum(f["progress"] for f in jobs[job_id]["files"])
-        count = len(jobs[job_id]["files"])
-        jobs[job_id]["progress"] = int(total / count) if count else 0
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/api/upload", methods=["POST"])
-def upload():
-    """Accept multiple files, store them, return a job_id."""
-    uploaded = request.files.getlist("files")
-    if not uploaded:
-        return jsonify({"error": "No files uploaded"}), 400
-
-    job_id = uuid.uuid4().hex[:12]
-    job_dir = UPLOAD_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
-    files_meta = []
-    for f in uploaded:
-        ext = Path(f.filename).suffix.lower()
-        if ext not in IMAGE_EXTENSIONS and ext not in VIDEO_EXTENSIONS:
-            continue
-        stored = uuid.uuid4().hex[:8] + ext
-        f.save(str(job_dir / stored))
-        file_type = "image" if ext in IMAGE_EXTENSIONS else "video"
-        files_meta.append({
-            "original_name": f.filename,
-            "stored_name": stored,
-            "type": file_type,
-            "status": "pending",
-            "progress": 0,
-        })
-
-    if not files_meta:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"error": "No supported files"}), 400
-
-    with jobs_lock:
-        jobs[job_id] = {
-            "status": "pending",
-            "progress": 0,
-            "files": files_meta,
-        }
-
-    return jsonify({"job_id": job_id, "files": files_meta})
-
+        if job_id in jobs:
+            jobs[job_id]["status"] = "done"
 
 @app.route("/api/process/<job_id>", methods=["POST"])
 def process(job_id: str):
@@ -526,17 +477,13 @@ def process(job_id: str):
         job["status"] = "processing"
 
     body = request.get_json(silent=True) or {}
-    strength = max(1, min(10, int(body.get("strength", 5))))
-    anti_ocr = bool(body.get("anti_ocr", False))
-    distort_scene = bool(body.get("distort_scene", False))
-    mask_audio_flag = bool(body.get("mask_audio", False))
-    deep_stealth = bool(body.get("deep_stealth", False))
-    v3 = bool(body.get("v3", False))
-    audio_stealth = bool(body.get("audio_stealth", False))
+    strength = max(1, min(10, int(body.get("strength", 7))))
+    profile = body.get("profile", "tt_ads")
+    custom_flags = body.get("custom_flags", {})
 
     t = threading.Thread(
-        target=_run_job,
-        args=(job_id, job["files"], strength, anti_ocr, distort_scene, mask_audio_flag, deep_stealth, v3, audio_stealth),
+        target=_run_job_v5,
+        args=(job_id, job["files"], strength, profile, custom_flags),
         daemon=True
     )
     t.start()

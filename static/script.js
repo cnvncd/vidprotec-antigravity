@@ -11,6 +11,7 @@ const state = {
     files: [],           // [{original_name, stored_name, type, status, progress, localUrl}]
     processing: false,
     pollTimer: null,
+    profile: "tt_ads",   // v5.0 Active Profile
 };
 
 // ---------------------------------------------------------------------------
@@ -151,8 +152,22 @@ function statusLabel(s) {
 }
 
 // ---------------------------------------------------------------------------
-// Strength slider
+// Profiles & Settings
 // ---------------------------------------------------------------------------
+$$(".profile-card").forEach(card => {
+    card.addEventListener("click", () => {
+        $$(".profile-card").forEach(c => c.classList.remove("active"));
+        card.classList.add("active");
+        state.profile = card.dataset.profile;
+        
+        // Auto-adjust strength based on profile
+        if (state.profile === "tt_ads") strengthSlider.value = 7;
+        else if (state.profile === "invisible") strengthSlider.value = 5;
+        else if (state.profile === "ghost") strengthSlider.value = 8;
+        strengthValue.textContent = strengthSlider.value;
+    });
+});
+
 strengthSlider.addEventListener("input", () => {
     strengthValue.textContent = strengthSlider.value;
 });
@@ -169,12 +184,12 @@ async function startProcessing() {
 
     const payload = {
         strength: +strengthSlider.value,
-        anti_ocr: $("#opt-ocr").checked,
-        distort_scene: $("#opt-scene").checked,
-        mask_audio: $("#opt-audio").checked,
-        deep_stealth: $("#opt-deep").checked,
-        v3: $("#opt-v3").checked,
-        audio_stealth: $("#opt-audio-stealth").checked,
+        profile: state.profile,
+        custom_flags: {
+            anti_ocr: $("#opt-ocr").checked,
+            distort_scene: $("#opt-scene").checked,
+            mask_audio: $("#opt-audio").checked
+        }
     };
 
     try {
