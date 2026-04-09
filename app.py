@@ -465,6 +465,69 @@ def _run_job_v5(job_id: str, files_meta: list, strength: int, profile: str, cust
         if job_id in jobs:
             jobs[job_id]["status"] = "done"
 
+
+def _update_file_status(job_id: str, file_idx: int, status: str, progress: int):
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]["files"][file_idx]["status"] = status
+            jobs[job_id]["files"][file_idx]["progress"] = progress
+            # Recalculate overall progress
+            total = sum(f["progress"] for f in jobs[job_id]["files"])
+            count = len(jobs[job_id]["files"])
+            jobs[job_id]["progress"] = int(total / count) if count else 0
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/upload", methods=["POST"])
+def upload():
+    """Accept multiple files, store them, return a job_id."""
+    uploaded = request.files.getlist("files")
+    if not uploaded:
+        return jsonify({"error": "No files uploaded"}), 400
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = UPLOAD_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    files_meta = []
+    for f in uploaded:
+        ext = Path(f.filename).suffix.lower()
+        if ext not in IMAGE_EXTENSIONS and ext not in VIDEO_EXTENSIONS:
+            continue
+        stored = uuid.uuid4().hex[:8] + ext
+        f.save(str(job_dir / stored))
+        file_type = "image" if ext in IMAGE_EXTENSIONS else "video"
+        files_meta.append({
+            "original_name": f.filename,
+            "stored_name": stored,
+            "type": file_type,
+            "status": "pending",
+            "progress": 0,
+        })
+
+    if not files_meta:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify({"error": "No supported files"}), 400
+
+    with jobs_lock:
+        jobs[job_id] = {
+            "status": "pending",
+            "progress": 0,
+            "files": files_meta,
+        }
+
+    return jsonify({"job_id": job_id, "files": files_meta})
+
+
 @app.route("/api/process/<job_id>", methods=["POST"])
 def process(job_id: str):
     """Start processing a previously uploaded job."""
