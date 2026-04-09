@@ -4,9 +4,9 @@ Applies imperceptible adversarial perturbation to images and video
 to defeat AI vision models, OCR, and speech recognition.
 """
 
+import logging
 import os
 import uuid
-import json
 import shutil
 import zipfile
 import subprocess
@@ -16,14 +16,25 @@ from io import BytesIO
 
 import cv2
 import numpy as np
-from PIL import Image
 from flask import (
     Flask, render_template, request, jsonify,
-    send_file, send_from_directory
+    send_file, send_from_directory, abort
 )
-from scipy.signal import butter, sosfilt
+from scipy.interpolate import RectBivariateSpline
+from scipy.signal import butter, lfilter, sosfilt
 from dotenv import load_dotenv
 import soundfile as sf
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -141,7 +152,6 @@ def _elastic_warp(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     dy = np.random.uniform(-amp, amp, yv.shape)
 
     # Upscale displacement to original size
-    from scipy.interpolate import RectBivariateSpline
     fx = RectBivariateSpline(y, x, dx)
     fy = RectBivariateSpline(y, x, dy)
 
@@ -251,7 +261,6 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
     # Approximate pink via cumulative filter
     b = [0.049922035, -0.095993537, 0.050612699, -0.004709510]
     a = [1.0, -2.494956002, 2.017265875, -0.522189400]
-    from scipy.signal import lfilter
     pink = lfilter(b, a, white)
     pink = pink / (np.max(np.abs(pink)) + 1e-9) * amp * 0.5
 
@@ -458,7 +467,7 @@ def _run_job_v5(job_id: str, files_meta: list, strength: int, profile: str, cust
             else:
                 _update_file_status(job_id, i, "error", 0)
         except Exception as e:
-            print(f"[ERROR] file {fm['original_name']}: {e}")
+            logger.exception("Failed to process file %s", fm["original_name"])
             _update_file_status(job_id, i, "error", 0)
 
     with jobs_lock:
@@ -494,7 +503,7 @@ def upload():
     if not uploaded:
         return jsonify({"error": "No files uploaded"}), 400
 
-    job_id = uuid.uuid4().hex[:12]
+    job_id = uuid.uuid4().hex
     job_dir = UPLOAD_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -563,25 +572,33 @@ def status(job_id: str):
         return jsonify(job)
 
 
+def _safe_filename(filename: str) -> str:
+    """Strip path components to prevent directory traversal."""
+    name = Path(filename).name
+    if not name or name.startswith("."):
+        abort(400)
+    return name
+
+
 @app.route("/api/preview/<job_id>/<filename>")
 def preview(job_id: str, filename: str):
     """Serve an uploaded (original) file for before/after preview."""
     job_dir = UPLOAD_DIR / job_id
-    return send_from_directory(str(job_dir), filename)
+    return send_from_directory(str(job_dir), _safe_filename(filename))
 
 
 @app.route("/api/result/<job_id>/<filename>")
 def result(job_id: str, filename: str):
     """Serve a processed file."""
     job_dir = OUTPUT_DIR / job_id
-    return send_from_directory(str(job_dir), filename)
+    return send_from_directory(str(job_dir), _safe_filename(filename))
 
 
 @app.route("/api/download/<job_id>/<filename>")
 def download_single(job_id: str, filename: str):
     """Download a single processed file."""
     job_dir = OUTPUT_DIR / job_id
-    return send_from_directory(str(job_dir), filename, as_attachment=True)
+    return send_from_directory(str(job_dir), _safe_filename(filename), as_attachment=True)
 
 
 @app.route("/api/download-all/<job_id>")
@@ -623,5 +640,5 @@ def delete_file(job_id: str, stored_name: str):
 if __name__ == "__main__":
     port = int(os.getenv("FLASK_PORT", "5000"))
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
-    print(f"\n  🛡️  StealthMask running at http://localhost:{port}\n")
+    logger.info("StealthMask running at http://localhost:%s", port)
     app.run(host="0.0.0.0", port=port, debug=debug)

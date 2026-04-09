@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 # Install ffmpeg (required for video/audio processing)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg git && \
+    apt-get install -y --no-install-recommends ffmpeg git curl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -23,5 +23,8 @@ USER user
 # HF Spaces expects port 7860
 ENV FLASK_PORT=7860
 EXPOSE 7860
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:7860/ || exit 1
 
 CMD ["python", "app.py"]
