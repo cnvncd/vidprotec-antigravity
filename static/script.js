@@ -188,7 +188,10 @@ async function startProcessing() {
         custom_flags: {
             anti_ocr: $("#opt-ocr").checked,
             distort_scene: $("#opt-scene").checked,
-            mask_audio: $("#opt-audio").checked
+            mask_audio: $("#opt-audio").checked,
+            dct_attack: $("#opt-dct").checked,
+            audio_fingerprint: $("#opt-fingerprint").checked,
+            color_jitter: $("#opt-color").checked,
         }
     };
 

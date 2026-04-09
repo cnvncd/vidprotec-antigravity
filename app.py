@@ -185,6 +185,130 @@ def _chroma_attack(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     return cv2.cvtColor(yuv_p, cv2.COLOR_YCrCb2BGR)
 
 
+def _dct_perturbation(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
+    """
+    Attack DCT frequency domain — this is where pHash, content-ID,
+    and most video fingerprinting systems operate.
+    Injects noise into mid-frequency DCT coefficients per 8x8 block.
+    """
+    np.random.seed((seed + 200) % (2**32))
+    result = img.copy().astype(np.float32)
+    amp = 0.8 + strength * 0.4
+
+    # Pre-compute mid-frequency mask (zigzag indices 2-6)
+    freq_mask = np.zeros((8, 8), dtype=np.float32)
+    for i in range(8):
+        for j in range(8):
+            if 2 <= i + j <= 6:
+                freq_mask[i, j] = 1.0
+
+    num_channels = result.shape[2] if result.ndim == 3 else 1
+    for c in range(num_channels):
+        channel = result[:, :, c] if result.ndim == 3 else result
+        h, w = channel.shape
+        # Trim to multiple of 8
+        bh, bw = (h // 8) * 8, (w // 8) * 8
+        # Process all 8x8 blocks via reshape
+        blocks = channel[:bh, :bw].reshape(bh // 8, 8, bw // 8, 8).transpose(0, 2, 1, 3)
+        nb_y, nb_x = blocks.shape[0], blocks.shape[1]
+        noise_all = np.random.uniform(-amp, amp, (nb_y, nb_x, 8, 8)).astype(np.float32)
+        for by in range(nb_y):
+            for bx in range(nb_x):
+                dct_block = cv2.dct(blocks[by, bx])
+                dct_block += noise_all[by, bx] * freq_mask
+                blocks[by, bx] = cv2.idct(dct_block)
+        channel[:bh, :bw] = blocks.transpose(0, 2, 1, 3).reshape(bh, bw)
+        if result.ndim == 3:
+            result[:, :, c] = channel
+
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def _color_gamma_jitter(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
+    """
+    Per-frame HSV micro-shift + gamma perturbation.
+    Breaks temporal consistency that fingerprinting relies on.
+    Each frame gets a slightly different color signature.
+    """
+    np.random.seed((seed + 500) % (2**32))
+
+    # Gamma perturbation (0.97 – 1.03, imperceptible)
+    gamma = 1.0 + np.random.uniform(-0.015, 0.015) * (strength / 5)
+    lut = np.array([((i / 255.0) ** (1.0 / gamma)) * 255
+                    for i in range(256)], dtype=np.uint8)
+    result = cv2.LUT(img, lut)
+
+    # HSV micro-shift
+    hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
+    # Hue shift: ±1-3 degrees (out of 180 in OpenCV)
+    hsv[:, :, 0] = (hsv[:, :, 0] + np.random.uniform(-1.5, 1.5) * (strength / 5)) % 180
+    # Saturation shift: ±1-2%
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + np.random.uniform(-0.015, 0.015) * (strength / 5)), 0, 255)
+    # Value/brightness shift: ±0.5-1%
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1.0 + np.random.uniform(-0.008, 0.008) * (strength / 5)), 0, 255)
+
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+def _break_audio_fingerprint(audio_path: str, output_path: str, strength: int, seed: int):
+    """
+    Attack audio fingerprinting systems (Shazam, AudioID, TikTok ACR).
+    These systems match by finding spectral peaks (constellation map).
+    Strategy: shift peaks, add phantom peaks, micro time-stretch.
+    """
+    data, sr = sf.read(audio_path, dtype="float64")
+    np.random.seed((seed + 999) % (2**32))
+    n = data.shape[0]
+
+    # --- 1. Micro time-stretch (imperceptible 0.3-1.5% change) ---
+    # Resample to slightly different rate, then back
+    stretch_factor = 1.0 + np.random.uniform(-0.008, 0.008) * (strength / 5)
+    new_n = int(n * stretch_factor)
+    if data.ndim > 1:
+        stretched = np.column_stack([
+            np.interp(np.linspace(0, n - 1, new_n), np.arange(n), data[:, ch])
+            for ch in range(data.shape[1])
+        ])
+    else:
+        stretched = np.interp(np.linspace(0, n - 1, new_n), np.arange(n), data)
+
+    # --- 2. Spectral peak injection (phantom peaks confuse constellation map) ---
+    t = np.arange(new_n) / sr
+    amp = 0.002 + (strength - 1) * 0.002  # 0.002 – 0.02
+    # Inject tones at semi-random frequencies that create false spectral peaks
+    phantom = np.zeros(new_n)
+    for _ in range(3 + strength):
+        freq = np.random.uniform(300, 8000)
+        phase = np.random.uniform(0, 2 * np.pi)
+        # Windowed burst (not constant — harder to filter out)
+        burst_start = np.random.randint(0, max(1, new_n - sr))
+        burst_len = np.random.randint(sr // 8, sr // 2)
+        burst_end = min(burst_start + burst_len, new_n)
+        window = np.hanning(burst_end - burst_start)
+        phantom[burst_start:burst_end] += np.sin(2 * np.pi * freq * t[burst_start:burst_end] + phase) * window * amp
+
+    if stretched.ndim > 1:
+        for ch in range(stretched.shape[1]):
+            stretched[:, ch] += phantom
+    else:
+        stretched += phantom
+
+    # --- 3. Micro pitch shift via harmonic distortion ---
+    # Add very low-level harmonics that shift the spectral centroid
+    for harmonic in [2, 3, 5]:
+        h_amp = amp * 0.15 / harmonic
+        freq_base = np.random.uniform(100, 500)
+        harm_tone = np.sin(2 * np.pi * freq_base * harmonic * t) * h_amp
+        if stretched.ndim > 1:
+            for ch in range(stretched.shape[1]):
+                stretched[:, ch] += harm_tone
+        else:
+            stretched += harm_tone
+
+    result = np.clip(stretched, -1.0, 1.0)
+    sf.write(output_path, result, sr)
+
+
 def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom_flags: dict = None):
     """Load an image, apply adversarial perturbation based on profile, save."""
     img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
@@ -198,7 +322,9 @@ def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom
         "anti_ocr": profile in ("tt_ads",),
         "distort_scene": profile in ("tt_ads", "ghost"),
         "v4_semantic": profile in ("tt_ads", "invisible"),
-        "deep_stealth": profile in ("tt_ads", "ghost")
+        "deep_stealth": profile in ("tt_ads", "ghost"),
+        "dct_attack": profile in ("tt_ads", "ghost"),
+        "color_jitter": profile in ("tt_ads",),
     }
     # Override with custom flags if provided
     if custom_flags:
@@ -209,15 +335,23 @@ def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom
     # v3 Neural Warp
     if settings["warp"]:
         img = _elastic_warp(img, strength, seed)
-    
+
     # v4 Chroma Attack
     if settings["chroma"]:
         img = _chroma_attack(img, strength, seed)
 
+    # v6 DCT frequency-domain attack
+    if settings["dct_attack"]:
+        img = _dct_perturbation(img, strength, seed)
+
+    # v6 Color/gamma jitter
+    if settings["color_jitter"]:
+        img = _color_gamma_jitter(img, strength, seed)
+
     processed = _adversarial_perturbation(
-        img, strength, 
-        settings["anti_ocr"], 
-        settings["distort_scene"], 
+        img, strength,
+        settings["anti_ocr"],
+        settings["distort_scene"],
         seed=seed
     )
 
@@ -312,8 +446,12 @@ def process_video_file(src: Path, dst: Path, strength: int, profile: str,
         "distort_scene": profile in ("tt_ads", "ghost"),
         "mask_audio": profile in ("tt_ads", "ghost"),
         "audio_stealth": profile in ("tt_ads",),
+        "audio_fingerprint": profile in ("tt_ads",),
         "v4_semantic": profile in ("tt_ads", "invisible"),
         "deep_stealth": profile in ("tt_ads", "ghost"),
+        "dct_attack": profile in ("tt_ads", "ghost"),
+        "color_jitter": profile in ("tt_ads",),
+        "encoding_randomize": profile in ("tt_ads", "ghost"),
         "metadata_strip": True
     }
     if custom_flags:
@@ -345,10 +483,16 @@ def process_video_file(src: Path, dst: Path, strength: int, profile: str,
             if settings["chroma"]:
                 frame = _chroma_attack(frame, strength, seed)
 
+            if settings["dct_attack"]:
+                frame = _dct_perturbation(frame, strength, seed)
+
+            if settings["color_jitter"]:
+                frame = _color_gamma_jitter(frame, strength, seed)
+
             processed = _adversarial_perturbation(
-                frame, strength, 
-                settings["anti_ocr"], 
-                settings["distort_scene"], 
+                frame, strength,
+                settings["anti_ocr"],
+                settings["distort_scene"],
                 seed=seed
             )
 
@@ -365,18 +509,33 @@ def process_video_file(src: Path, dst: Path, strength: int, profile: str,
                 on_progress(int(idx / total_frames * 90))
         cap.release()
 
-        # --- Reassemble ---
+        # --- Reassemble with encoding randomization ---
         raw_video = str(tmp_dir / "video_noaudio.mp4")
+
+        # v6: Randomize encoding parameters to create unique file signature
+        if settings["encoding_randomize"]:
+            crf = str(np.random.randint(17, 20))           # 17-19
+            gop = str(np.random.randint(24, 72))           # keyframe interval
+            bf = str(np.random.randint(1, 4))              # B-frames
+            tune = np.random.choice(["film", "animation", "grain"])
+        else:
+            crf = "18"
+            gop = "250"
+            bf = "2"
+            tune = "film"
+
         mux_args = [
             "ffmpeg", "-y", "-framerate", str(fps),
             "-i", str(frames_dir / "%08d.png"),
             "-c:v", "libx264", "-preset", "fast",
-            "-crf", "18", "-pix_fmt", "yuv420p",
+            "-tune", tune,
+            "-crf", crf, "-pix_fmt", "yuv420p",
+            "-g", gop, "-bf", bf,
             "-vf", f"scale={width}:{height}"
         ]
         if settings["metadata_strip"]:
             mux_args += ["-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact"]
-        
+
         mux_args.append(raw_video)
         subprocess.run(mux_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
@@ -390,6 +549,11 @@ def process_video_file(src: Path, dst: Path, strength: int, profile: str,
                 masked = str(tmp_dir / "audio_mask.wav")
                 _mask_audio(audio_tmp, masked, strength)
                 final_audio = masked
+
+            if settings["audio_fingerprint"]:
+                fp_broken = str(tmp_dir / "audio_fp.wav")
+                _break_audio_fingerprint(final_audio, fp_broken, strength, global_seed)
+                final_audio = fp_broken
 
             if settings["audio_stealth"]:
                 stealth = str(tmp_dir / "audio_stealth.wav")

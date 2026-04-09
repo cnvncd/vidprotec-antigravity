@@ -25,7 +25,7 @@
     </script>
 
     <!-- Custom styles with cache busting -->
-    <link rel="stylesheet" href="/static/styles.css?v=5.0">
+    <link rel="stylesheet" href="/static/styles.css?v=6.0">
 </head>
 <body class="min-h-screen text-gray-200">
 
@@ -44,7 +44,7 @@
                 </div>
                 <h1 class="text-xl font-bold tracking-tight">
                     <span class="text-white">Stealth</span><span class="text-brand">Mask</span>
-                    <span class="text-[10px] bg-white/10 px-1.5 py-0.5 rounded ml-1 text-gray-400">v5.0 Smart</span>
+                    <span class="text-[10px] bg-white/10 px-1.5 py-0.5 rounded ml-1 text-gray-400">v6.0 TT-Bypass</span>
                 </h1>
             </div>
             <a href="https://github.com" target="_blank"
@@ -172,7 +172,7 @@
                         <svg class="w-3 h-3 group-open:rotate-180 transition" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M19 9l-7 7-7-7" stroke-width="3"></path></svg>
                         Настройки эксперта
                     </summary>
-                    <div class="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-4 p-4 bg-black/10 rounded-xl border border-white/5">
+                    <div class="mt-4 grid grid-cols-2 sm:grid-cols-3 gap-4 p-4 bg-black/10 rounded-xl border border-white/5">
                         <label class="flex items-start gap-3 cursor-pointer group">
                             <input type="checkbox" id="opt-ocr" checked class="check-custom mt-0.5">
                             <span class="text-xs text-gray-400 group-hover:text-white transition">Анти-OCR</span>
@@ -183,7 +183,19 @@
                         </label>
                         <label class="flex items-start gap-3 cursor-pointer group">
                             <input type="checkbox" id="opt-audio" checked class="check-custom mt-0.5">
-                            <span class="text-xs text-gray-400 group-hover:text-white transition">Аудио-шум</span>
+                            <span class="text-xs text-gray-400 group-hover:text-white transition">Аудио-маскировка</span>
+                        </label>
+                        <label class="flex items-start gap-3 cursor-pointer group">
+                            <input type="checkbox" id="opt-dct" checked class="check-custom mt-0.5">
+                            <span class="text-xs text-gray-400 group-hover:text-white transition">DCT-атака</span>
+                        </label>
+                        <label class="flex items-start gap-3 cursor-pointer group">
+                            <input type="checkbox" id="opt-fingerprint" checked class="check-custom mt-0.5">
+                            <span class="text-xs text-gray-400 group-hover:text-white transition">Анти-фингерпринт</span>
+                        </label>
+                        <label class="flex items-start gap-3 cursor-pointer group">
+                            <input type="checkbox" id="opt-color" checked class="check-custom mt-0.5">
+                            <span class="text-xs text-gray-400 group-hover:text-white transition">Цвет/гамма</span>
                         </label>
                     </div>
                 </details>
@@ -257,6 +269,6 @@
         </div>
     </footer>
 
-    <script src="/static/script.js?v=5.0"></script>
+    <script src="/static/script.js?v=6.0"></script>
 </body>
 </html>
