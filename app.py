@@ -434,8 +434,9 @@ _VIDEO_WORKERS = max(2, (os.cpu_count() or 4) // max(1, MAX_CONCURRENT_JOBS))
 
 def _process_video_frame(frame: np.ndarray, idx: int, strength: int,
                           global_seed: int, height: int, width: int,
-                          pad_h: int, pad_w: int) -> bytes:
-    """Run the full per-frame filter stack. Returns raw BGR bytes for ffmpeg."""
+                          pad_h: int, pad_w: int) -> tuple:
+    """Run the full per-frame filter stack. Returns (raw BGR bytes, work_seconds)."""
+    t0 = time.perf_counter()
     seed = global_seed + idx
     frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
     frame = _chroma_attack(frame, strength, seed)
@@ -451,7 +452,7 @@ def _process_video_frame(frame: np.ndarray, idx: int, strength: int,
 
     if not processed.flags["C_CONTIGUOUS"]:
         processed = np.ascontiguousarray(processed)
-    return processed.tobytes()
+    return processed.tobytes(), time.perf_counter() - t0
 
 
 def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
@@ -499,17 +500,27 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
+        logger.info(
+            "[video] start src=%s res=%dx%d fps=%.2f frames=%d "
+            "cpu_count=%s workers=%d",
+            src.name, width, height, fps, total_frames,
+            os.cpu_count(), _VIDEO_WORKERS,
+        )
+
         # Parallel frame processing: workers run the filter stack, main thread
         # drains futures in submission order and pipes raw bytes to ffmpeg.
         # Bounded inflight queue prevents the whole video from being read into RAM.
         max_inflight = _VIDEO_WORKERS * 3
         futures: deque = deque()
         written = 0
+        total_work = 0.0        # sum of per-frame CPU seconds (from workers)
+        wall_start = time.perf_counter()
 
         def _drain_one():
-            nonlocal written
-            data = futures.popleft().result()
+            nonlocal written, total_work
+            data, work = futures.popleft().result()
             ff.stdin.write(data)
+            total_work += work
             written += 1
             if on_progress and total_frames > 0:
                 on_progress(int(written / total_frames * 90))
@@ -549,6 +560,19 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
             ff.wait()
         if ff.returncode != 0:
             raise RuntimeError(f"ffmpeg encode failed with code {ff.returncode}")
+
+        wall = time.perf_counter() - wall_start
+        per_frame = (total_work / written) if written else 0.0
+        # If parallelism is real, total_work >> wall (work happens concurrently).
+        # effective_parallelism ~= number of cores actually busy on our work.
+        eff_par = (total_work / wall) if wall > 0 else 0.0
+        logger.info(
+            "[video] done frames=%d wall=%.2fs work_sum=%.2fs "
+            "per_frame=%.3fs encoded_fps=%.2f eff_parallelism=%.2fx (of %d workers)",
+            written, wall, total_work, per_frame,
+            written / wall if wall > 0 else 0.0,
+            eff_par, _VIDEO_WORKERS,
+        )
 
         # --- Audio ---
         audio_tmp = str(tmp_dir / "audio.wav")
