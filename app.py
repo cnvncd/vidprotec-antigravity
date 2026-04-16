@@ -26,7 +26,6 @@ from flask import (
     send_file, send_from_directory, abort
 )
 from scipy.fft import dctn, idctn
-from scipy.interpolate import RectBivariateSpline
 from scipy.signal import butter, lfilter, sosfilt
 from dotenv import load_dotenv
 import soundfile as sf
@@ -94,14 +93,14 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
     # Thread-local RNG so parallel workers don't stomp on a shared seed.
     rng = np.random.default_rng(seed % (2**32)) if seed else np.random.default_rng()
 
-    noise = np.zeros_like(img_array, dtype=np.float64)
+    # float32 is plenty for 8-bit image noise and halves memory traffic.
+    noise = np.zeros(img_array.shape, dtype=np.float32)
 
     # --- Layer 1: Gaussian noise ---
-    gaussian = rng.normal(0, epsilon * 0.45, img_array.shape)
-    noise += gaussian
+    noise += rng.normal(0, epsilon * 0.45, img_array.shape).astype(np.float32)
 
     # --- Layer 2: High-frequency grid noise ---
-    hf = np.zeros_like(img_array, dtype=np.float64)
+    hf = np.zeros(img_array.shape, dtype=np.float32)
     hf[0::2, 1::2] = epsilon * 0.35
     hf[1::2, 0::2] = epsilon * 0.35
     hf[0::2, 0::2] = -epsilon * 0.35
@@ -111,70 +110,74 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
     # --- Layer 3: Sinusoidal wave (with phase shift) ---
     phase_x = (seed * 0.13) if seed else 0
     phase_y = (seed * 0.07) if seed else 0
-    y_coords = np.arange(h).reshape(-1, 1)
-    x_coords = np.arange(w).reshape(1, -1)
+    y_coords = np.arange(h, dtype=np.float32).reshape(-1, 1)
+    x_coords = np.arange(w, dtype=np.float32).reshape(1, -1)
     freq = 0.05 + strength * 0.015
     sin_pattern = np.sin(2 * np.pi * freq * x_coords + phase_x + y_coords * freq * 0.7 + phase_y)
-    sin_pattern = sin_pattern * epsilon * 0.3
+    sin_pattern *= np.float32(epsilon * 0.3)
     if channels > 1:
-        sin_pattern = np.stack([sin_pattern] * channels, axis=-1)
-    noise += sin_pattern
+        noise += sin_pattern[:, :, None]
+    else:
+        noise += sin_pattern
 
     # --- Layer 4 (anti-OCR): mid-frequency horizontal stripes ---
     if anti_ocr:
-        stripe = np.sin(2 * np.pi * y_coords * 0.12 + phase_y * 0.5) * epsilon * 0.5
-        stripe_pattern = np.broadcast_to(
-            stripe[:, :, np.newaxis] if channels > 1 else stripe,
-            img_array.shape
-        ).copy().astype(np.float64)
-        noise += stripe_pattern
+        stripe = np.sin(2 * np.pi * y_coords * 0.12 + phase_y * 0.5) * np.float32(epsilon * 0.5)
+        if channels > 1:
+            noise += stripe[:, :, None]
+        else:
+            noise += stripe
 
     # --- Layer 5 (scene distortion): radial gradient perturbation ---
     if distort_scene:
-        cy, cx = h / 2 + (seed % 10 - 5 if seed else 0), w / 2 + (seed % 14 - 7 if seed else 0)
-        yy, xx = np.mgrid[0:h, 0:w]
-        radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+        cy = h / 2 + (seed % 10 - 5 if seed else 0)
+        cx = w / 2 + (seed % 14 - 7 if seed else 0)
+        yy = y_coords - np.float32(cy)
+        xx = x_coords - np.float32(cx)
+        radius = np.sqrt(yy * yy + xx * xx)
         max_r = np.sqrt((h/2) ** 2 + (w/2) ** 2)
-        radial = np.cos(radius / max_r * np.pi * (3 + strength * 0.5) + phase_x * 0.2)
-        radial = radial * epsilon * 0.4
+        radial = np.cos(radius / np.float32(max_r) * np.float32(np.pi * (3 + strength * 0.5))
+                        + np.float32(phase_x * 0.2))
+        radial *= np.float32(epsilon * 0.4)
         if channels > 1:
-            radial = np.stack([radial] * channels, axis=-1)
-        noise += radial
+            noise += radial[:, :, None]
+        else:
+            noise += radial
 
-    # Apply & clamp
-    result = img_array.astype(np.float64) + noise
-    return np.clip(result, 0, 255).astype(np.uint8)
+    # Apply & clamp (work in float32; cast back to uint8 at the end).
+    result = img_array.astype(np.float32) + noise
+    np.clip(result, 0, 255, out=result)
+    return result.astype(np.uint8)
 
 
 def _elastic_warp(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     """
     Apply low-frequency mesh distortion to break pHash and SSIM.
-    strength: 1-10
-    seed: random factor
+    Displacement is a 5x5 random grid upsampled with cv2.resize (C, fast) —
+    the old scipy RectBivariateSpline path was the dominant cost per frame.
     """
     rows, cols = img.shape[:2]
     rng = np.random.default_rng(seed % (2**32))
 
-    # Grid control points (low freq)
     grid_size = 5
-    x = np.linspace(0, cols, grid_size)
-    y = np.linspace(0, rows, grid_size)
-    xv, yv = np.meshgrid(x, y)
-
-    # Random displacement
     amp = 1.0 + strength * 0.8
-    dx = rng.uniform(-amp, amp, xv.shape)
-    dy = rng.uniform(-amp, amp, yv.shape)
+    dx = rng.uniform(-amp, amp, (grid_size, grid_size)).astype(np.float32)
+    dy = rng.uniform(-amp, amp, (grid_size, grid_size)).astype(np.float32)
+    dx_full = cv2.resize(dx, (cols, rows), interpolation=cv2.INTER_CUBIC)
+    dy_full = cv2.resize(dy, (cols, rows), interpolation=cv2.INTER_CUBIC)
 
-    # Upscale displacement to original size
-    fx = RectBivariateSpline(y, x, dx)
-    fy = RectBivariateSpline(y, x, dy)
+    base_x, base_y = np.meshgrid(
+        np.arange(cols, dtype=np.float32),
+        np.arange(rows, dtype=np.float32),
+    )
+    map_x = base_x + dx_full
+    map_y = base_y + dy_full
 
-    map_x, map_y = np.meshgrid(np.arange(cols), np.arange(rows))
-    map_x = map_x.astype(np.float32) + fx(np.arange(rows), np.arange(cols)).astype(np.float32)
-    map_y = map_y.astype(np.float32) + fy(np.arange(rows), np.arange(cols)).astype(np.float32)
-
-    return cv2.remap(img, map_x, map_y, cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT)
+    # Max displacement is ~strength pixels; bilinear is visually identical to
+    # LANCZOS4 at that scale and ~10x faster on a full-frame remap.
+    return cv2.remap(img, map_x, map_y,
+                     interpolation=cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REFLECT)
 
 
 def _chroma_attack(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
@@ -476,29 +479,44 @@ def _process_video_batch(frames: list, start_idx: int, strength: int,
                           global_seed: int, height: int, width: int,
                           pad_h: int, pad_w: int) -> tuple:
     """Run the filter stack on a batch of frames. Returns (list of raw BGR
-    bytes in order, total worker time). Batching amortizes pickle/IPC cost."""
-    t0 = time.perf_counter()
+    bytes in order, dict of per-stage seconds). Batching amortizes pickle/IPC."""
+    timings = {"warp": 0.0, "chroma": 0.0, "dct": 0.0, "color": 0.0,
+               "adv": 0.0, "crop": 0.0}
     out: list = []
     for offset, frame in enumerate(frames):
         idx = start_idx + offset
         seed = global_seed + idx
 
+        t = time.perf_counter()
         frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
-        frame = _chroma_attack(frame, strength, seed)
-        frame = _dct_perturbation(frame, strength, seed)
-        frame = _color_gamma_jitter(frame, strength, seed)
+        timings["warp"] += time.perf_counter() - t
 
+        t = time.perf_counter()
+        frame = _chroma_attack(frame, strength, seed)
+        timings["chroma"] += time.perf_counter() - t
+
+        t = time.perf_counter()
+        frame = _dct_perturbation(frame, strength, seed)
+        timings["dct"] += time.perf_counter() - t
+
+        t = time.perf_counter()
+        frame = _color_gamma_jitter(frame, strength, seed)
+        timings["color"] += time.perf_counter() - t
+
+        t = time.perf_counter()
         processed = _adversarial_perturbation(
             frame, strength, anti_ocr=True, distort_scene=True, seed=seed
         )
+        timings["adv"] += time.perf_counter() - t
 
+        t = time.perf_counter()
         crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
-        processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
-
+        processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LINEAR)
         if not processed.flags["C_CONTIGUOUS"]:
             processed = np.ascontiguousarray(processed)
         out.append(processed.tobytes())
-    return out, time.perf_counter() - t0
+        timings["crop"] += time.perf_counter() - t
+    return out, timings
 
 
 def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
@@ -559,16 +577,18 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
         max_inflight = _VIDEO_WORKERS * 3
         futures: deque = deque()
         written = 0
-        total_work = 0.0
+        total_timings = {"warp": 0.0, "chroma": 0.0, "dct": 0.0, "color": 0.0,
+                         "adv": 0.0, "crop": 0.0}
         wall_start = time.perf_counter()
 
         def _drain_one():
-            nonlocal written, total_work
-            batch_bytes, work = futures.popleft().result()
+            nonlocal written
+            batch_bytes, timings = futures.popleft().result()
             for data in batch_bytes:
                 ff.stdin.write(data)
                 written += 1
-            total_work += work
+            for k, v in timings.items():
+                total_timings[k] += v
             if on_progress and total_frames > 0:
                 on_progress(int(written / total_frames * 90))
 
@@ -617,9 +637,8 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
             raise RuntimeError(f"ffmpeg encode failed with code {ff.returncode}")
 
         wall = time.perf_counter() - wall_start
+        total_work = sum(total_timings.values())
         per_frame = (total_work / written) if written else 0.0
-        # If parallelism is real, total_work >> wall (work happens concurrently).
-        # effective_parallelism ~= number of cores actually busy on our work.
         eff_par = (total_work / wall) if wall > 0 else 0.0
         logger.info(
             "[video] frames_done frames=%d wall=%.2fs work_sum=%.2fs "
@@ -628,6 +647,9 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
             written / wall if wall > 0 else 0.0,
             eff_par, _VIDEO_WORKERS,
         )
+        if written:
+            per = {k: f"{(v / written) * 1000:.1f}ms" for k, v in total_timings.items()}
+            logger.info("[video] per-filter per-frame: %s", per)
 
         # --- Audio ---
         logger.info("[video] extracting audio")
