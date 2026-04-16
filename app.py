@@ -96,10 +96,13 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
     # float32 is plenty for 8-bit image noise and halves memory traffic.
     noise = np.zeros(img_array.shape, dtype=np.float32)
 
-    # --- Layer 1: Gaussian noise ---
-    # standard_normal(dtype=float32) generates in float32 directly;
-    # rng.normal returns float64 which we'd then cast (2x memory traffic).
-    noise += rng.standard_normal(img_array.shape, dtype=np.float32) * np.float32(epsilon * 0.45)
+    # --- Layer 1: broadband noise ---
+    # rng.random (uniform) is 3-5x faster than standard_normal (which
+    # does Box-Muller with log/sqrt/cos per sample pair). For adversarial
+    # perturbation the exact distribution doesn't matter; we scale the
+    # uniform range to match the original Gaussian stddev (0.45*eps).
+    scale = np.float32(epsilon * 0.45 * np.sqrt(3))
+    noise += rng.random(img_array.shape, dtype=np.float32) * np.float32(2 * scale) - scale
 
     # --- Layer 2: High-frequency grid noise ---
     hf = np.zeros(img_array.shape, dtype=np.float32)
@@ -191,12 +194,14 @@ def _chroma_attack(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     y, cr, cb = cv2.split(yuv)
 
     rng = np.random.default_rng((seed + 77) % (2**32))
-    amp = np.float32(1 + strength * 0.5)
+    amp = 1 + strength * 0.5
 
     # Noise on chroma channels only (Cb, Cr) — most AI vision models
-    # fingerprint on Y. standard_normal(float32) avoids the float64 cast.
-    noise_cr = (rng.standard_normal(cr.shape, dtype=np.float32) * amp).astype(np.int16)
-    noise_cb = (rng.standard_normal(cb.shape, dtype=np.float32) * amp).astype(np.int16)
+    # fingerprint on Y. Uniform noise (rng.random) is 3-5x faster than
+    # Gaussian standard_normal; scale to match original stddev.
+    uamp = np.float32(amp * np.sqrt(3))
+    noise_cr = (rng.random(cr.shape, dtype=np.float32) * np.float32(2 * uamp) - uamp).astype(np.int16)
+    noise_cb = (rng.random(cb.shape, dtype=np.float32) * np.float32(2 * uamp) - uamp).astype(np.int16)
 
     cr = np.clip(cr.astype(np.int16) + noise_cr, 0, 255).astype(np.uint8)
     cb = np.clip(cb.astype(np.int16) + noise_cb, 0, 255).astype(np.uint8)
