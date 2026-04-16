@@ -12,6 +12,7 @@ import shutil
 import zipfile
 import subprocess
 import atexit
+import multiprocessing as mp
 import threading
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -450,8 +451,15 @@ def _get_frame_pool() -> ProcessPoolExecutor:
     if _frame_pool is None:
         with _frame_pool_lock:
             if _frame_pool is None:
-                _frame_pool = ProcessPoolExecutor(max_workers=_VIDEO_WORKERS)
-                logger.info("Initialized frame process pool with %d workers",
+                # 'spawn' instead of default 'fork' — fork would make workers
+                # inherit every open fd, including ffmpeg's stdin pipe, so
+                # closing the pipe in the parent would never reach EOF and
+                # ffmpeg would hang forever on wait().
+                ctx = mp.get_context("spawn")
+                _frame_pool = ProcessPoolExecutor(
+                    max_workers=_VIDEO_WORKERS, mp_context=ctx,
+                )
+                logger.info("Initialized frame process pool with %d workers (spawn)",
                             _VIDEO_WORKERS)
     return _frame_pool
 
@@ -614,7 +622,7 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
         # effective_parallelism ~= number of cores actually busy on our work.
         eff_par = (total_work / wall) if wall > 0 else 0.0
         logger.info(
-            "[video] done frames=%d wall=%.2fs work_sum=%.2fs "
+            "[video] frames_done frames=%d wall=%.2fs work_sum=%.2fs "
             "per_frame=%.3fs encoded_fps=%.2f eff_parallelism=%.2fx (of %d workers)",
             written, wall, total_work, per_frame,
             written / wall if wall > 0 else 0.0,
@@ -622,16 +630,20 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
         )
 
         # --- Audio ---
+        logger.info("[video] extracting audio")
         audio_tmp = str(tmp_dir / "audio.wav")
         has_audio = _extract_audio(str(src), audio_tmp)
 
         if has_audio:
+            logger.info("[video] masking audio")
             masked = str(tmp_dir / "audio_mask.wav")
             _mask_audio(audio_tmp, masked, strength)
 
+            logger.info("[video] breaking audio fingerprint")
             fp_broken = str(tmp_dir / "audio_fp.wav")
             _break_audio_fingerprint(masked, fp_broken, strength, global_seed)
 
+            logger.info("[video] applying stealth filters")
             stealth = str(tmp_dir / "audio_stealth.wav")
             pitch = 0.99 + (global_seed % 20) * 0.001
             filters = [
@@ -641,40 +653,65 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
                 "vibrato=f=2:d=0.2",
                 f"asetrate=44100*{pitch},aresample=44100",
             ]
-            subprocess.run([
+            _run_ffmpeg_safe([
                 "ffmpeg", "-y", "-i", fp_broken,
                 "-af", ",".join(filters), stealth,
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            ], timeout=120, label="stealth filters")
 
+            logger.info("[video] muxing video+audio")
             _mux_video_audio(raw_video, stealth, str(dst))
         else:
+            logger.info("[video] no audio track, copying video only")
             shutil.copy2(raw_video, str(dst))
 
         if on_progress:
             on_progress(100)
+        logger.info("[video] done src=%s", src.name)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _run_ffmpeg_safe(args: list, timeout: int, label: str):
+    """Run ffmpeg with a timeout and capture stderr so we can see failures."""
+    try:
+        result = subprocess.run(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("[video] ffmpeg %s timed out after %ds", label, timeout)
+        raise
+    if result.returncode != 0:
+        tail = (result.stderr or b"").decode(errors="replace")[-2000:]
+        logger.error("[video] ffmpeg %s failed rc=%d stderr=%s",
+                     label, result.returncode, tail)
+        raise RuntimeError(f"ffmpeg {label} failed with code {result.returncode}")
+
+
 def _extract_audio(video_path: str, audio_path: str) -> bool:
     """Extract audio track from video using ffmpeg. Returns False if no audio."""
-    result = subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-vn",
-         "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", audio_path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-vn",
+             "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", audio_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("[video] audio extract timed out")
+        return False
     return result.returncode == 0 and os.path.exists(audio_path)
 
 
 def _mux_video_audio(video_path: str, audio_path: str, output_path: str):
     """Combine processed video and audio into final file with total metadata strip."""
-    subprocess.run([
+    _run_ffmpeg_safe([
         "ffmpeg", "-y",
         "-i", video_path, "-i", audio_path,
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
-        "-shortest", output_path
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        "-shortest", output_path,
+    ], timeout=120, label="mux")
 
 
 # ---------------------------------------------------------------------------
