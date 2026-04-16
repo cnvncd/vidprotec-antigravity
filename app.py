@@ -73,47 +73,6 @@ job_executor = ThreadPoolExecutor(
 )
 
 # ---------------------------------------------------------------------------
-# Profile resolution
-# ---------------------------------------------------------------------------
-
-# Maps profile name -> set of feature flags that are ON for that profile.
-# Adding a new profile = add one entry here. Frontend must use the same key.
-_PROFILE_FLAGS = {
-    "tt_ads": {
-        "warp", "chroma", "anti_ocr", "distort_scene", "v4_semantic",
-        "deep_stealth", "dct_attack", "color_jitter",
-        "mask_audio", "audio_stealth", "audio_fingerprint",
-        "encoding_randomize",
-    },
-    "invisible": {"v4_semantic"},
-    "ghost": {
-        "warp", "chroma", "distort_scene", "deep_stealth",
-        "dct_attack", "mask_audio", "encoding_randomize",
-    },
-}
-
-# Every flag the engine knows about. metadata_strip is always on.
-_ALL_FLAGS = (
-    "warp", "chroma", "anti_ocr", "distort_scene", "v4_semantic",
-    "deep_stealth", "dct_attack", "color_jitter",
-    "mask_audio", "audio_stealth", "audio_fingerprint",
-    "encoding_randomize",
-)
-
-
-def resolve_profile(profile: str, custom_flags: dict | None = None) -> dict:
-    """Build the full settings dict for a given profile + optional overrides."""
-    enabled = _PROFILE_FLAGS.get(profile, set())
-    settings = {flag: (flag in enabled) for flag in _ALL_FLAGS}
-    settings["metadata_strip"] = True
-    if custom_flags:
-        for k, v in custom_flags.items():
-            if k in settings:
-                settings[k] = bool(v)
-    return settings
-
-
-# ---------------------------------------------------------------------------
 # Adversarial perturbation core
 # ---------------------------------------------------------------------------
 
@@ -364,8 +323,8 @@ def _break_audio_fingerprint(audio_path: str, output_path: str, strength: int, s
     sf.write(output_path, result, sr)
 
 
-def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom_flags: dict = None):
-    """Load an image, apply adversarial perturbation based on profile, save."""
+def process_image_file(src: Path, dst: Path, strength: int):
+    """Load an image, apply the full TikTok Ads perturbation stack, save."""
     img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError(f"Cannot read image: {src}")
@@ -379,39 +338,23 @@ def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom
     elif img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
-    settings = resolve_profile(profile, custom_flags)
     seed = np.random.randint(0, 10000)
 
-    # v3 Neural Warp
-    if settings["warp"]:
-        img = _elastic_warp(img, strength, seed)
-
-    # v4 Chroma Attack
-    if settings["chroma"]:
-        img = _chroma_attack(img, strength, seed)
-
-    # v6 DCT frequency-domain attack
-    if settings["dct_attack"]:
-        img = _dct_perturbation(img, strength, seed)
-
-    # v6 Color/gamma jitter
-    if settings["color_jitter"]:
-        img = _color_gamma_jitter(img, strength, seed)
+    img = _elastic_warp(img, strength, seed)
+    img = _chroma_attack(img, strength, seed)
+    img = _dct_perturbation(img, strength, seed)
+    img = _color_gamma_jitter(img, strength, seed)
 
     processed = _adversarial_perturbation(
-        img, strength,
-        settings["anti_ocr"],
-        settings["distort_scene"],
-        seed=seed
+        img, strength, anti_ocr=True, distort_scene=True, seed=seed
     )
 
-    # v2/v4 pHash breaker (zoom)
-    if settings["deep_stealth"] or settings["v4_semantic"]:
-        h, w = processed.shape[:2]
-        pad = int(min(h, w) * 0.006)
-        if pad > 0:
-            crop = processed[pad:h-pad, pad:w-pad]
-            processed = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    # pHash breaker (zoom)
+    h, w = processed.shape[:2]
+    pad = int(min(h, w) * 0.006)
+    if pad > 0:
+        crop = processed[pad:h-pad, pad:w-pad]
+        processed = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LANCZOS4)
 
     ext = dst.suffix.lower()
     if alpha is not None and ext in (".png", ".webp"):
@@ -483,16 +426,10 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 # ---------------------------------------------------------------------------
 
 
-def process_video_file(src: Path, dst: Path, strength: int, profile: str, 
-                        custom_flags: dict = None, on_progress=None):
-    """
-    Process a video using smart profiles. 
-    v5.0 Unified Engine.
-    """
+def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
+    """Process a video through the full TikTok Ads bypass pipeline."""
     tmp_dir = dst.parent / f"_tmp_{dst.stem}"
     tmp_dir.mkdir(exist_ok=True)
-
-    settings = resolve_profile(profile, custom_flags)
 
     try:
         cap = cv2.VideoCapture(str(src))
@@ -501,120 +438,106 @@ def process_video_file(src: Path, dst: Path, strength: int, profile: str,
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        frames_dir = tmp_dir / "frames"
-        frames_dir.mkdir(exist_ok=True)
+        global_seed = np.random.randint(0, 10000)
+        raw_video = str(tmp_dir / "video_noaudio.mp4")
+
+        # Randomize encoding parameters for a unique file signature.
+        crf = str(np.random.randint(17, 20))
+        gop = str(np.random.randint(24, 72))
+        bf = str(np.random.randint(1, 4))
+        tune = str(np.random.choice(["film", "animation", "grain"]))
+
+        # Stream raw BGR frames directly into ffmpeg stdin — avoids per-frame
+        # PNG encode/decode and disk I/O, which was the dominant bottleneck.
+        mux_args = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-pixel_format", "bgr24",
+            "-video_size", f"{width}x{height}",
+            "-framerate", str(fps),
+            "-i", "-",
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-tune", tune,
+            "-crf", crf, "-pix_fmt", "yuv420p",
+            "-g", gop, "-bf", bf,
+            "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact",
+            raw_video,
+        ]
+
+        ff = subprocess.Popen(
+            mux_args, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
         idx = 0
-        global_seed = np.random.randint(0, 10000)
+        pad_h = pad_w = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+                seed = global_seed + idx
 
-            seed = global_seed + idx
-            
-            if settings["warp"]:
                 frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
-            
-            if settings["chroma"]:
                 frame = _chroma_attack(frame, strength, seed)
-
-            if settings["dct_attack"]:
                 frame = _dct_perturbation(frame, strength, seed)
-
-            if settings["color_jitter"]:
                 frame = _color_gamma_jitter(frame, strength, seed)
 
-            processed = _adversarial_perturbation(
-                frame, strength,
-                settings["anti_ocr"],
-                settings["distort_scene"],
-                seed=seed
-            )
+                processed = _adversarial_perturbation(
+                    frame, strength, anti_ocr=True, distort_scene=True, seed=seed
+                )
 
-            if settings["deep_stealth"] or settings["v4_semantic"]:
                 if idx == 0:
                     jitter = 0.003 + (global_seed % 50) * 0.0001
                     pad_h, pad_w = int(height * jitter), int(width * jitter)
                 crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
                 processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
 
-            cv2.imwrite(str(frames_dir / f"{idx:08d}.png"), processed)
-            idx += 1
-            if on_progress and total_frames > 0:
-                on_progress(int(idx / total_frames * 90))
-        cap.release()
-
-        # --- Reassemble with encoding randomization ---
-        raw_video = str(tmp_dir / "video_noaudio.mp4")
-
-        # v6: Randomize encoding parameters to create unique file signature
-        if settings["encoding_randomize"]:
-            crf = str(np.random.randint(17, 20))           # 17-19
-            gop = str(np.random.randint(24, 72))           # keyframe interval
-            bf = str(np.random.randint(1, 4))              # B-frames
-            tune = np.random.choice(["film", "animation", "grain"])
-        else:
-            crf = "18"
-            gop = "250"
-            bf = "2"
-            tune = "film"
-
-        mux_args = [
-            "ffmpeg", "-y", "-framerate", str(fps),
-            "-i", str(frames_dir / "%08d.png"),
-            "-c:v", "libx264", "-preset", "fast",
-            "-tune", tune,
-            "-crf", crf, "-pix_fmt", "yuv420p",
-            "-g", gop, "-bf", bf,
-            "-vf", f"scale={width}:{height}"
-        ]
-        if settings["metadata_strip"]:
-            mux_args += ["-map_metadata", "-1", "-fflags", "+bitexact", "-flags:v", "+bitexact"]
-
-        mux_args.append(raw_video)
-        subprocess.run(mux_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                if not processed.flags["C_CONTIGUOUS"]:
+                    processed = np.ascontiguousarray(processed)
+                ff.stdin.write(processed.tobytes())
+                idx += 1
+                if on_progress and total_frames > 0:
+                    on_progress(int(idx / total_frames * 90))
+        finally:
+            cap.release()
+            if ff.stdin:
+                ff.stdin.close()
+            ff.wait()
+        if ff.returncode != 0:
+            raise RuntimeError(f"ffmpeg encode failed with code {ff.returncode}")
 
         # --- Audio ---
         audio_tmp = str(tmp_dir / "audio.wav")
         has_audio = _extract_audio(str(src), audio_tmp)
 
         if has_audio:
-            final_audio = audio_tmp
-            if settings["mask_audio"]:
-                masked = str(tmp_dir / "audio_mask.wav")
-                _mask_audio(audio_tmp, masked, strength)
-                final_audio = masked
+            masked = str(tmp_dir / "audio_mask.wav")
+            _mask_audio(audio_tmp, masked, strength)
 
-            if settings["audio_fingerprint"]:
-                fp_broken = str(tmp_dir / "audio_fp.wav")
-                _break_audio_fingerprint(final_audio, fp_broken, strength, global_seed)
-                final_audio = fp_broken
+            fp_broken = str(tmp_dir / "audio_fp.wav")
+            _break_audio_fingerprint(masked, fp_broken, strength, global_seed)
 
-            if settings["audio_stealth"]:
-                stealth = str(tmp_dir / "audio_stealth.wav")
-                filters = [
-                    f"aphaser=in_gain=0.6:out_gain=0.8:delay=3:speed=1:type=t",
-                    f"aecho=0.8:0.88:30:0.4",
-                    f"tremolo=f=4:d=0.3",
-                    f"vibrato=f=2:d=0.2"
-                ]
-                # Pitch jitter
-                pitch = 0.99 + (global_seed % 20) * 0.001
-                filters.append(f"asetrate=44100*{pitch},aresample=44100")
-                
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", final_audio, 
-                    "-af", ",".join(filters), stealth
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                final_audio = stealth
+            stealth = str(tmp_dir / "audio_stealth.wav")
+            pitch = 0.99 + (global_seed % 20) * 0.001
+            filters = [
+                "aphaser=in_gain=0.6:out_gain=0.8:delay=3:speed=1:type=t",
+                "aecho=0.8:0.88:30:0.4",
+                "tremolo=f=4:d=0.3",
+                "vibrato=f=2:d=0.2",
+                f"asetrate=44100*{pitch},aresample=44100",
+            ]
+            subprocess.run([
+                "ffmpeg", "-y", "-i", fp_broken,
+                "-af", ",".join(filters), stealth,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            _mux_video_audio(raw_video, final_audio, str(dst))
+            _mux_video_audio(raw_video, stealth, str(dst))
         else:
             shutil.copy2(raw_video, str(dst))
 
-        if on_progress: on_progress(100)
+        if on_progress:
+            on_progress(100)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -645,7 +568,7 @@ def _mux_video_audio(video_path: str, audio_path: str, output_path: str):
 # ---------------------------------------------------------------------------
 
 
-def _run_job_v5(job_id: str, files_meta: list, strength: int, profile: str, custom_flags: dict):
+def _run_job(job_id: str, files_meta: list, strength: int):
     """Process every file in the job. Runs in a background thread."""
     job_output = OUTPUT_DIR / job_id
     job_output.mkdir(exist_ok=True)
@@ -658,16 +581,16 @@ def _run_job_v5(job_id: str, files_meta: list, strength: int, profile: str, cust
 
         try:
             if ext in IMAGE_EXTENSIONS:
-                process_image_file(src, dst, strength, profile, custom_flags)
+                process_image_file(src, dst, strength)
                 _update_file_status(job_id, i, "done", 100)
             elif ext in VIDEO_EXTENSIONS:
                 def progress_cb(pct, _i=i):
                     _update_file_status(job_id, _i, "processing", pct)
-                process_video_file(src, dst, strength, profile, custom_flags, on_progress=progress_cb)
+                process_video_file(src, dst, strength, on_progress=progress_cb)
                 _update_file_status(job_id, i, "done", 100)
             else:
                 _update_file_status(job_id, i, "error", 0)
-        except Exception as e:
+        except Exception:
             logger.exception("Failed to process file %s", fm["original_name"])
             _update_file_status(job_id, i, "error", 0)
 
@@ -803,12 +726,8 @@ def process(job_id: str):
 
     body = request.get_json(silent=True) or {}
     strength = max(1, min(10, int(body.get("strength", 7))))
-    profile = body.get("profile", "tt_ads")
-    custom_flags = body.get("custom_flags", {})
 
-    job_executor.submit(
-        _run_job_v5, job_id, job["files"], strength, profile, custom_flags
-    )
+    job_executor.submit(_run_job, job_id, job["files"], strength)
     return jsonify({"status": "processing"})
 
 

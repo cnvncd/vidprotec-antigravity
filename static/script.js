@@ -11,14 +11,12 @@ const state = {
     files: [],           // [{original_name, stored_name, type, status, progress, localUrl}]
     processing: false,
     pollTimer: null,
-    profile: "tt_ads",   // v5.0 Active Profile
 };
 
 // ---------------------------------------------------------------------------
 // DOM refs
 // ---------------------------------------------------------------------------
 const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => document.querySelectorAll(sel);
 
 const dropzone        = $("#dropzone");
 const fileInput       = $("#file-input");
@@ -152,22 +150,8 @@ function statusLabel(s) {
 }
 
 // ---------------------------------------------------------------------------
-// Profiles & Settings
+// Strength slider
 // ---------------------------------------------------------------------------
-$$(".profile-card").forEach(card => {
-    card.addEventListener("click", () => {
-        $$(".profile-card").forEach(c => c.classList.remove("active"));
-        card.classList.add("active");
-        state.profile = card.dataset.profile;
-        
-        // Auto-adjust strength based on profile
-        if (state.profile === "tt_ads") strengthSlider.value = 7;
-        else if (state.profile === "invisible") strengthSlider.value = 5;
-        else if (state.profile === "ghost") strengthSlider.value = 8;
-        strengthValue.textContent = strengthSlider.value;
-    });
-});
-
 strengthSlider.addEventListener("input", () => {
     strengthValue.textContent = strengthSlider.value;
 });
@@ -182,18 +166,7 @@ async function startProcessing() {
     state.processing = true;
     processBtn.disabled = true;
 
-    const payload = {
-        strength: +strengthSlider.value,
-        profile: state.profile,
-        custom_flags: {
-            anti_ocr: $("#opt-ocr").checked,
-            distort_scene: $("#opt-scene").checked,
-            mask_audio: $("#opt-audio").checked,
-            dct_attack: $("#opt-dct").checked,
-            audio_fingerprint: $("#opt-fingerprint").checked,
-            color_jitter: $("#opt-color").checked,
-        }
-    };
+    const payload = { strength: +strengthSlider.value };
 
     try {
         const res = await fetch(`/api/process/${state.jobId}`, {
