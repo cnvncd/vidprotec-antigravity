@@ -12,6 +12,7 @@ import shutil
 import zipfile
 import subprocess
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from io import BytesIO
@@ -88,14 +89,13 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
     channels = img_array.shape[2] if img_array.ndim == 3 else 1
     epsilon = 2.0 + (strength - 1) * 2.5
 
-    # Random patterns grounded by seed
-    if seed:
-        np.random.seed(seed % (2**32))
+    # Thread-local RNG so parallel workers don't stomp on a shared seed.
+    rng = np.random.default_rng(seed % (2**32)) if seed else np.random.default_rng()
 
     noise = np.zeros_like(img_array, dtype=np.float64)
 
     # --- Layer 1: Gaussian noise ---
-    gaussian = np.random.normal(0, epsilon * 0.45, img_array.shape)
+    gaussian = rng.normal(0, epsilon * 0.45, img_array.shape)
     noise += gaussian
 
     # --- Layer 2: High-frequency grid noise ---
@@ -151,7 +151,7 @@ def _elastic_warp(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     seed: random factor
     """
     rows, cols = img.shape[:2]
-    np.random.seed(seed % (2**32))
+    rng = np.random.default_rng(seed % (2**32))
 
     # Grid control points (low freq)
     grid_size = 5
@@ -161,8 +161,8 @@ def _elastic_warp(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
 
     # Random displacement
     amp = 1.0 + strength * 0.8
-    dx = np.random.uniform(-amp, amp, xv.shape)
-    dy = np.random.uniform(-amp, amp, yv.shape)
+    dx = rng.uniform(-amp, amp, xv.shape)
+    dy = rng.uniform(-amp, amp, yv.shape)
 
     # Upscale displacement to original size
     fx = RectBivariateSpline(y, x, dx)
@@ -183,13 +183,13 @@ def _chroma_attack(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
     y, cr, cb = cv2.split(yuv)
 
-    np.random.seed((seed + 77) % (2**32))
+    rng = np.random.default_rng((seed + 77) % (2**32))
     amp = 1 + strength * 0.5
 
     # Apply noise to Chroma channels only (Cb, Cr)
     # Most AIs focus on Luma (Y) features
-    noise_cr = np.random.normal(0, amp, cr.shape).astype(np.int16)
-    noise_cb = np.random.normal(0, amp, cb.shape).astype(np.int16)
+    noise_cr = rng.normal(0, amp, cr.shape).astype(np.int16)
+    noise_cb = rng.normal(0, amp, cb.shape).astype(np.int16)
 
     cr = np.clip(cr.astype(np.int16) + noise_cr, 0, 255).astype(np.uint8)
     cb = np.clip(cb.astype(np.int16) + noise_cb, 0, 255).astype(np.uint8)
@@ -244,10 +244,10 @@ def _color_gamma_jitter(img: np.ndarray, strength: int, seed: int) -> np.ndarray
     Breaks temporal consistency that fingerprinting relies on.
     Each frame gets a slightly different color signature.
     """
-    np.random.seed((seed + 500) % (2**32))
+    rng = np.random.default_rng((seed + 500) % (2**32))
 
     # Gamma perturbation (0.97 – 1.03, imperceptible)
-    gamma = 1.0 + np.random.uniform(-0.015, 0.015) * (strength / 5)
+    gamma = 1.0 + rng.uniform(-0.015, 0.015) * (strength / 5)
     lut = np.array([((i / 255.0) ** (1.0 / gamma)) * 255
                     for i in range(256)], dtype=np.uint8)
     result = cv2.LUT(img, lut)
@@ -255,11 +255,11 @@ def _color_gamma_jitter(img: np.ndarray, strength: int, seed: int) -> np.ndarray
     # HSV micro-shift
     hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
     # Hue shift: ±1-3 degrees (out of 180 in OpenCV)
-    hsv[:, :, 0] = (hsv[:, :, 0] + np.random.uniform(-1.5, 1.5) * (strength / 5)) % 180
+    hsv[:, :, 0] = (hsv[:, :, 0] + rng.uniform(-1.5, 1.5) * (strength / 5)) % 180
     # Saturation shift: ±1-2%
-    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + np.random.uniform(-0.015, 0.015) * (strength / 5)), 0, 255)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (1.0 + rng.uniform(-0.015, 0.015) * (strength / 5)), 0, 255)
     # Value/brightness shift: ±0.5-1%
-    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1.0 + np.random.uniform(-0.008, 0.008) * (strength / 5)), 0, 255)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1.0 + rng.uniform(-0.008, 0.008) * (strength / 5)), 0, 255)
 
     return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
@@ -271,12 +271,12 @@ def _break_audio_fingerprint(audio_path: str, output_path: str, strength: int, s
     Strategy: shift peaks, add phantom peaks, micro time-stretch.
     """
     data, sr = sf.read(audio_path, dtype="float64")
-    np.random.seed((seed + 999) % (2**32))
+    rng = np.random.default_rng((seed + 999) % (2**32))
     n = data.shape[0]
 
     # --- 1. Micro time-stretch (imperceptible 0.3-1.5% change) ---
     # Resample to slightly different rate, then back
-    stretch_factor = 1.0 + np.random.uniform(-0.008, 0.008) * (strength / 5)
+    stretch_factor = 1.0 + rng.uniform(-0.008, 0.008) * (strength / 5)
     new_n = int(n * stretch_factor)
     if data.ndim > 1:
         stretched = np.column_stack([
@@ -292,11 +292,11 @@ def _break_audio_fingerprint(audio_path: str, output_path: str, strength: int, s
     # Inject tones at semi-random frequencies that create false spectral peaks
     phantom = np.zeros(new_n)
     for _ in range(3 + strength):
-        freq = np.random.uniform(300, 8000)
-        phase = np.random.uniform(0, 2 * np.pi)
+        freq = rng.uniform(300, 8000)
+        phase = rng.uniform(0, 2 * np.pi)
         # Windowed burst (not constant — harder to filter out)
-        burst_start = np.random.randint(0, max(1, new_n - sr))
-        burst_len = np.random.randint(sr // 8, sr // 2)
+        burst_start = int(rng.integers(0, max(1, new_n - sr)))
+        burst_len = int(rng.integers(sr // 8, sr // 2))
         burst_end = min(burst_start + burst_len, new_n)
         window = np.hanning(burst_end - burst_start)
         phantom[burst_start:burst_end] += np.sin(2 * np.pi * freq * t[burst_start:burst_end] + phase) * window * amp
@@ -311,7 +311,7 @@ def _break_audio_fingerprint(audio_path: str, output_path: str, strength: int, s
     # Add very low-level harmonics that shift the spectral centroid
     for harmonic in [2, 3, 5]:
         h_amp = amp * 0.15 / harmonic
-        freq_base = np.random.uniform(100, 500)
+        freq_base = rng.uniform(100, 500)
         harm_tone = np.sin(2 * np.pi * freq_base * harmonic * t) * h_amp
         if stretched.ndim > 1:
             for ch in range(stretched.shape[1]):
@@ -381,6 +381,7 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
     data, sr = sf.read(audio_path, dtype="float64")
     mono = data.mean(axis=1) if data.ndim > 1 else data
     n = len(mono)
+    rng = np.random.default_rng()
 
     # Scale mask to a fraction of source RMS — keeps it inaudible regardless
     # of source loudness. Floor at -60 dBFS so total silence still gets a tiny
@@ -391,7 +392,7 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
     amp = src_rms * mask_ratio
 
     # --- Pink noise (1/f) ---
-    white = np.random.randn(n)
+    white = rng.standard_normal(n)
     b = [0.049922035, -0.095993537, 0.050612699, -0.004709510]
     a = [1.0, -2.494956002, 2.017265875, -0.522189400]
     pink = lfilter(b, a, white)
@@ -404,7 +405,7 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 
     # --- Phase distortion (band-limited noise in mid range) ---
     sos = butter(4, [1000, 4000], btype="bandpass", fs=sr, output="sos")
-    phase_dist = sosfilt(sos, np.random.randn(n)) * amp * 0.2
+    phase_dist = sosfilt(sos, rng.standard_normal(n)) * amp * 0.2
 
     mask = pink + fm_low + fm_high + phase_dist
 
@@ -424,6 +425,33 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 # ---------------------------------------------------------------------------
 # Video processing
 # ---------------------------------------------------------------------------
+
+
+# Cap workers per video so two concurrent video jobs don't oversubscribe
+# the CPU. Each job still gets plenty of parallelism.
+_VIDEO_WORKERS = max(2, (os.cpu_count() or 4) // max(1, MAX_CONCURRENT_JOBS))
+
+
+def _process_video_frame(frame: np.ndarray, idx: int, strength: int,
+                          global_seed: int, height: int, width: int,
+                          pad_h: int, pad_w: int) -> bytes:
+    """Run the full per-frame filter stack. Returns raw BGR bytes for ffmpeg."""
+    seed = global_seed + idx
+    frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
+    frame = _chroma_attack(frame, strength, seed)
+    frame = _dct_perturbation(frame, strength, seed)
+    frame = _color_gamma_jitter(frame, strength, seed)
+
+    processed = _adversarial_perturbation(
+        frame, strength, anti_ocr=True, distort_scene=True, seed=seed
+    )
+
+    crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
+    processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+    if not processed.flags["C_CONTIGUOUS"]:
+        processed = np.ascontiguousarray(processed)
+    return processed.tobytes()
 
 
 def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
@@ -447,8 +475,11 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
         bf = str(np.random.randint(1, 4))
         tune = str(np.random.choice(["film", "animation", "grain"]))
 
-        # Stream raw BGR frames directly into ffmpeg stdin — avoids per-frame
-        # PNG encode/decode and disk I/O, which was the dominant bottleneck.
+        # Constant crop jitter derived from global_seed (was computed at idx=0
+        # in the old sequential loop; hoisted so all workers see the same values).
+        jitter = 0.003 + (global_seed % 50) * 0.0001
+        pad_h, pad_w = int(height * jitter), int(width * jitter)
+
         mux_args = [
             "ffmpeg", "-y",
             "-f", "rawvideo", "-pixel_format", "bgr24",
@@ -468,37 +499,49 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-        idx = 0
-        pad_h = pad_w = 0
+        # Parallel frame processing: workers run the filter stack, main thread
+        # drains futures in submission order and pipes raw bytes to ffmpeg.
+        # Bounded inflight queue prevents the whole video from being read into RAM.
+        max_inflight = _VIDEO_WORKERS * 3
+        futures: deque = deque()
+        written = 0
+
+        def _drain_one():
+            nonlocal written
+            data = futures.popleft().result()
+            ff.stdin.write(data)
+            written += 1
+            if on_progress and total_frames > 0:
+                on_progress(int(written / total_frames * 90))
+
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            with ThreadPoolExecutor(
+                max_workers=_VIDEO_WORKERS,
+                thread_name_prefix="stealthmask-frame",
+            ) as pool:
+                idx = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-                seed = global_seed + idx
+                    # Block when the queue is full so we don't read ahead forever.
+                    while len(futures) >= max_inflight:
+                        _drain_one()
 
-                frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
-                frame = _chroma_attack(frame, strength, seed)
-                frame = _dct_perturbation(frame, strength, seed)
-                frame = _color_gamma_jitter(frame, strength, seed)
+                    futures.append(pool.submit(
+                        _process_video_frame, frame, idx, strength,
+                        global_seed, height, width, pad_h, pad_w,
+                    ))
+                    idx += 1
 
-                processed = _adversarial_perturbation(
-                    frame, strength, anti_ocr=True, distort_scene=True, seed=seed
-                )
+                    # Opportunistic drain — head ready? pipe it without blocking encode.
+                    while futures and futures[0].done():
+                        _drain_one()
 
-                if idx == 0:
-                    jitter = 0.003 + (global_seed % 50) * 0.0001
-                    pad_h, pad_w = int(height * jitter), int(width * jitter)
-                crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
-                processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
-
-                if not processed.flags["C_CONTIGUOUS"]:
-                    processed = np.ascontiguousarray(processed)
-                ff.stdin.write(processed.tobytes())
-                idx += 1
-                if on_progress and total_frames > 0:
-                    on_progress(int(idx / total_frames * 90))
+                # Drain remaining in order.
+                while futures:
+                    _drain_one()
         finally:
             cap.release()
             if ff.stdin:
