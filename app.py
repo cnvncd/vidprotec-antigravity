@@ -97,7 +97,9 @@ def _adversarial_perturbation(img_array: np.ndarray, strength: int,
     noise = np.zeros(img_array.shape, dtype=np.float32)
 
     # --- Layer 1: Gaussian noise ---
-    noise += rng.normal(0, epsilon * 0.45, img_array.shape).astype(np.float32)
+    # standard_normal(dtype=float32) generates in float32 directly;
+    # rng.normal returns float64 which we'd then cast (2x memory traffic).
+    noise += rng.standard_normal(img_array.shape, dtype=np.float32) * np.float32(epsilon * 0.45)
 
     # --- Layer 2: High-frequency grid noise ---
     hf = np.zeros(img_array.shape, dtype=np.float32)
@@ -189,12 +191,12 @@ def _chroma_attack(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     y, cr, cb = cv2.split(yuv)
 
     rng = np.random.default_rng((seed + 77) % (2**32))
-    amp = 1 + strength * 0.5
+    amp = np.float32(1 + strength * 0.5)
 
-    # Apply noise to Chroma channels only (Cb, Cr)
-    # Most AIs focus on Luma (Y) features
-    noise_cr = rng.normal(0, amp, cr.shape).astype(np.int16)
-    noise_cb = rng.normal(0, amp, cb.shape).astype(np.int16)
+    # Noise on chroma channels only (Cb, Cr) — most AI vision models
+    # fingerprint on Y. standard_normal(float32) avoids the float64 cast.
+    noise_cr = (rng.standard_normal(cr.shape, dtype=np.float32) * amp).astype(np.int16)
+    noise_cb = (rng.standard_normal(cb.shape, dtype=np.float32) * amp).astype(np.int16)
 
     cr = np.clip(cr.astype(np.int16) + noise_cr, 0, 255).astype(np.uint8)
     cb = np.clip(cb.astype(np.int16) + noise_cb, 0, 255).astype(np.uint8)
@@ -211,25 +213,27 @@ _DCT_FREQ_MASK = np.array(
 
 def _dct_perturbation(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     """
-    Attack DCT frequency domain — this is where pHash, content-ID,
-    and most video fingerprinting systems operate.
-    Injects noise into mid-frequency DCT coefficients per 8x8 block.
-    Vectorized: dctn over the last two axes processes all blocks at once.
+    Attack DCT frequency domain on the Y (luminance) channel only —
+    pHash, TikTok ACR, and most content-ID systems fingerprint on
+    luminance, so perturbing Cr/Cb here was doing 2/3 of the work
+    with no extra bypass effectiveness. Injects noise into
+    mid-frequency DCT coefficients per 8x8 block.
     """
     rng = np.random.default_rng((seed + 200) % (2**32))
     amp = 0.8 + strength * 0.4
 
-    arr = img.astype(np.float32, copy=True)
-    if arr.ndim == 2:
-        arr = arr[:, :, None]
-    h, w, c = arr.shape
+    yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    y = yuv[:, :, 0]
+
+    arr = y.astype(np.float32, copy=True)
+    h, w = arr.shape
     bh, bw = (h // 8) * 8, (w // 8) * 8
     if bh == 0 or bw == 0:
         return img
 
-    # (bh/8, 8, bw/8, 8, C) -> (bh/8, bw/8, C, 8, 8)
+    # (bh/8, 8, bw/8, 8) -> (bh/8, bw/8, 8, 8)
     region = arr[:bh, :bw]
-    blocks = region.reshape(bh // 8, 8, bw // 8, 8, c).transpose(0, 2, 4, 1, 3)
+    blocks = region.reshape(bh // 8, 8, bw // 8, 8).transpose(0, 2, 1, 3)
     blocks = np.ascontiguousarray(blocks)
 
     coeffs = dctn(blocks, type=2, norm="ortho", axes=(-2, -1))
@@ -237,10 +241,10 @@ def _dct_perturbation(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     coeffs += noise
     blocks = idctn(coeffs, type=2, norm="ortho", axes=(-2, -1)).astype(np.float32)
 
-    arr[:bh, :bw] = blocks.transpose(0, 3, 1, 4, 2).reshape(bh, bw, c)
-    if img.ndim == 2:
-        arr = arr[:, :, 0]
-    return np.clip(arr, 0, 255).astype(np.uint8)
+    arr[:bh, :bw] = blocks.transpose(0, 2, 1, 3).reshape(bh, bw)
+    np.clip(arr, 0, 255, out=arr)
+    yuv[:, :, 0] = arr.astype(np.uint8)
+    return cv2.cvtColor(yuv, cv2.COLOR_YCrCb2BGR)
 
 
 def _color_gamma_jitter(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
