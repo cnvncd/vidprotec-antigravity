@@ -11,9 +11,10 @@ import uuid
 import shutil
 import zipfile
 import subprocess
+import atexit
 import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from io import BytesIO
 
@@ -431,6 +432,32 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 # the CPU. Each job still gets plenty of parallelism.
 _VIDEO_WORKERS = max(2, (os.cpu_count() or 4) // max(1, MAX_CONCURRENT_JOBS))
 
+# Process pool for per-frame work. ProcessPool (not ThreadPool) because the
+# filter stack hits GIL bottlenecks — Python bookkeeping between numpy/cv2
+# calls serializes threads. Each process has its own GIL → true parallelism.
+# Lazy-init: avoid forking workers at import time when gunicorn boots.
+_frame_pool: ProcessPoolExecutor | None = None
+_frame_pool_lock = threading.Lock()
+
+
+def _get_frame_pool() -> ProcessPoolExecutor:
+    global _frame_pool
+    if _frame_pool is None:
+        with _frame_pool_lock:
+            if _frame_pool is None:
+                _frame_pool = ProcessPoolExecutor(max_workers=_VIDEO_WORKERS)
+                logger.info("Initialized frame process pool with %d workers",
+                            _VIDEO_WORKERS)
+    return _frame_pool
+
+
+@atexit.register
+def _shutdown_frame_pool():
+    global _frame_pool
+    if _frame_pool is not None:
+        _frame_pool.shutdown(wait=False, cancel_futures=True)
+        _frame_pool = None
+
 
 def _process_video_frame(frame: np.ndarray, idx: int, strength: int,
                           global_seed: int, height: int, width: int,
@@ -525,34 +552,31 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
             if on_progress and total_frames > 0:
                 on_progress(int(written / total_frames * 90))
 
+        pool = _get_frame_pool()
         try:
-            with ThreadPoolExecutor(
-                max_workers=_VIDEO_WORKERS,
-                thread_name_prefix="stealthmask-frame",
-            ) as pool:
-                idx = 0
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
+            idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-                    # Block when the queue is full so we don't read ahead forever.
-                    while len(futures) >= max_inflight:
-                        _drain_one()
-
-                    futures.append(pool.submit(
-                        _process_video_frame, frame, idx, strength,
-                        global_seed, height, width, pad_h, pad_w,
-                    ))
-                    idx += 1
-
-                    # Opportunistic drain — head ready? pipe it without blocking encode.
-                    while futures and futures[0].done():
-                        _drain_one()
-
-                # Drain remaining in order.
-                while futures:
+                # Block when the queue is full so we don't read ahead forever.
+                while len(futures) >= max_inflight:
                     _drain_one()
+
+                futures.append(pool.submit(
+                    _process_video_frame, frame, idx, strength,
+                    global_seed, height, width, pad_h, pad_w,
+                ))
+                idx += 1
+
+                # Opportunistic drain — head ready? pipe it without blocking encode.
+                while futures and futures[0].done():
+                    _drain_one()
+
+            # Drain remaining in order.
+            while futures:
+                _drain_one()
         finally:
             cap.release()
             if ff.stdin:
