@@ -6,11 +6,13 @@ to defeat AI vision models, OCR, and speech recognition.
 
 import logging
 import os
+import time
 import uuid
 import shutil
 import zipfile
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from io import BytesIO
 
@@ -20,6 +22,7 @@ from flask import (
     Flask, render_template, request, jsonify,
     send_file, send_from_directory, abort
 )
+from scipy.fft import dctn, idctn
 from scipy.interpolate import RectBivariateSpline
 from scipy.signal import butter, lfilter, sosfilt
 from dotenv import load_dotenv
@@ -52,12 +55,63 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MAX_CONTENT_MB = int(os.getenv("MAX_CONTENT_MB", "500"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_MB * 1024 * 1024
 
+# How long uploads/outputs and their job records live before being swept.
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", str(60 * 60)))      # 1h default
+CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))  # 5m
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"}
 
-# In-memory job tracker: job_id -> {status, progress, files: [{name, status, progress}]}
+# In-memory job tracker: job_id -> {status, progress, files, created_at, finished_at}
 jobs: dict = {}
 jobs_lock = threading.Lock()
+
+# Bounded worker pool — protects against OOM under load.
+job_executor = ThreadPoolExecutor(
+    max_workers=MAX_CONCURRENT_JOBS, thread_name_prefix="stealthmask-job"
+)
+
+# ---------------------------------------------------------------------------
+# Profile resolution
+# ---------------------------------------------------------------------------
+
+# Maps profile name -> set of feature flags that are ON for that profile.
+# Adding a new profile = add one entry here. Frontend must use the same key.
+_PROFILE_FLAGS = {
+    "tt_ads": {
+        "warp", "chroma", "anti_ocr", "distort_scene", "v4_semantic",
+        "deep_stealth", "dct_attack", "color_jitter",
+        "mask_audio", "audio_stealth", "audio_fingerprint",
+        "encoding_randomize",
+    },
+    "invisible": {"v4_semantic"},
+    "ghost": {
+        "warp", "chroma", "distort_scene", "deep_stealth",
+        "dct_attack", "mask_audio", "encoding_randomize",
+    },
+}
+
+# Every flag the engine knows about. metadata_strip is always on.
+_ALL_FLAGS = (
+    "warp", "chroma", "anti_ocr", "distort_scene", "v4_semantic",
+    "deep_stealth", "dct_attack", "color_jitter",
+    "mask_audio", "audio_stealth", "audio_fingerprint",
+    "encoding_randomize",
+)
+
+
+def resolve_profile(profile: str, custom_flags: dict | None = None) -> dict:
+    """Build the full settings dict for a given profile + optional overrides."""
+    enabled = _PROFILE_FLAGS.get(profile, set())
+    settings = {flag: (flag in enabled) for flag in _ALL_FLAGS}
+    settings["metadata_strip"] = True
+    if custom_flags:
+        for k, v in custom_flags.items():
+            if k in settings:
+                settings[k] = bool(v)
+    return settings
+
 
 # ---------------------------------------------------------------------------
 # Adversarial perturbation core
@@ -185,43 +239,44 @@ def _chroma_attack(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     return cv2.cvtColor(yuv_p, cv2.COLOR_YCrCb2BGR)
 
 
+_DCT_FREQ_MASK = np.array(
+    [[1.0 if 2 <= i + j <= 6 else 0.0 for j in range(8)] for i in range(8)],
+    dtype=np.float32,
+)
+
+
 def _dct_perturbation(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
     """
     Attack DCT frequency domain — this is where pHash, content-ID,
     and most video fingerprinting systems operate.
     Injects noise into mid-frequency DCT coefficients per 8x8 block.
+    Vectorized: dctn over the last two axes processes all blocks at once.
     """
-    np.random.seed((seed + 200) % (2**32))
-    result = img.copy().astype(np.float32)
+    rng = np.random.default_rng((seed + 200) % (2**32))
     amp = 0.8 + strength * 0.4
 
-    # Pre-compute mid-frequency mask (zigzag indices 2-6)
-    freq_mask = np.zeros((8, 8), dtype=np.float32)
-    for i in range(8):
-        for j in range(8):
-            if 2 <= i + j <= 6:
-                freq_mask[i, j] = 1.0
+    arr = img.astype(np.float32, copy=True)
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    h, w, c = arr.shape
+    bh, bw = (h // 8) * 8, (w // 8) * 8
+    if bh == 0 or bw == 0:
+        return img
 
-    num_channels = result.shape[2] if result.ndim == 3 else 1
-    for c in range(num_channels):
-        channel = result[:, :, c] if result.ndim == 3 else result
-        h, w = channel.shape
-        # Trim to multiple of 8
-        bh, bw = (h // 8) * 8, (w // 8) * 8
-        # Process all 8x8 blocks via reshape
-        blocks = channel[:bh, :bw].reshape(bh // 8, 8, bw // 8, 8).transpose(0, 2, 1, 3)
-        nb_y, nb_x = blocks.shape[0], blocks.shape[1]
-        noise_all = np.random.uniform(-amp, amp, (nb_y, nb_x, 8, 8)).astype(np.float32)
-        for by in range(nb_y):
-            for bx in range(nb_x):
-                dct_block = cv2.dct(blocks[by, bx])
-                dct_block += noise_all[by, bx] * freq_mask
-                blocks[by, bx] = cv2.idct(dct_block)
-        channel[:bh, :bw] = blocks.transpose(0, 2, 1, 3).reshape(bh, bw)
-        if result.ndim == 3:
-            result[:, :, c] = channel
+    # (bh/8, 8, bw/8, 8, C) -> (bh/8, bw/8, C, 8, 8)
+    region = arr[:bh, :bw]
+    blocks = region.reshape(bh // 8, 8, bw // 8, 8, c).transpose(0, 2, 4, 1, 3)
+    blocks = np.ascontiguousarray(blocks)
 
-    return np.clip(result, 0, 255).astype(np.uint8)
+    coeffs = dctn(blocks, type=2, norm="ortho", axes=(-2, -1))
+    noise = rng.uniform(-amp, amp, coeffs.shape).astype(np.float32) * _DCT_FREQ_MASK
+    coeffs += noise
+    blocks = idctn(coeffs, type=2, norm="ortho", axes=(-2, -1)).astype(np.float32)
+
+    arr[:bh, :bw] = blocks.transpose(0, 3, 1, 4, 2).reshape(bh, bw, c)
+    if img.ndim == 2:
+        arr = arr[:, :, 0]
+    return np.clip(arr, 0, 255).astype(np.uint8)
 
 
 def _color_gamma_jitter(img: np.ndarray, strength: int, seed: int) -> np.ndarray:
@@ -315,21 +370,16 @@ def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom
     if img is None:
         raise ValueError(f"Cannot read image: {src}")
 
-    # Default profile settings
-    settings = {
-        "warp": profile in ("tt_ads", "ghost"),
-        "chroma": profile in ("tt_ads", "ghost"),
-        "anti_ocr": profile in ("tt_ads",),
-        "distort_scene": profile in ("tt_ads", "ghost"),
-        "v4_semantic": profile in ("tt_ads", "invisible"),
-        "deep_stealth": profile in ("tt_ads", "ghost"),
-        "dct_attack": profile in ("tt_ads", "ghost"),
-        "color_jitter": profile in ("tt_ads",),
-    }
-    # Override with custom flags if provided
-    if custom_flags:
-        settings.update(custom_flags)
+    # Strip alpha — color-space ops (YCrCb, HSV, LUT) require 3 channels.
+    # Alpha is dropped because all our perturbations target visual signal.
+    alpha = None
+    if img.ndim == 3 and img.shape[2] == 4:
+        alpha = img[:, :, 3]
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    elif img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
+    settings = resolve_profile(profile, custom_flags)
     seed = np.random.randint(0, 10000)
 
     # v3 Neural Warp
@@ -364,6 +414,9 @@ def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom
             processed = cv2.resize(crop, (w, h), interpolation=cv2.INTER_LANCZOS4)
 
     ext = dst.suffix.lower()
+    if alpha is not None and ext in (".png", ".webp"):
+        processed = cv2.cvtColor(processed, cv2.COLOR_BGR2BGRA)
+        processed[:, :, 3] = alpha
     if ext in (".jpg", ".jpeg"):
         cv2.imwrite(str(dst), processed, [cv2.IMWRITE_JPEG_QUALITY, 97])
     elif ext == ".webp":
@@ -380,19 +433,22 @@ def process_image_file(src: Path, dst: Path, strength: int, profile: str, custom
 def _mask_audio(audio_path: str, output_path: str, strength: int):
     """
     Add imperceptible noise to audio that disrupts Whisper / Deepgram / Grok.
-    Combines:
-      - Low-volume pink noise (broadband masking)
-      - Phase distortion via all-pass-like filter
-      - Frequency-modulated tones in Whisper-sensitive bands (200-800 Hz, 3-6 kHz)
+    Mask amplitude is scaled to source RMS so quiet tracks don't get audible hiss.
     """
     data, sr = sf.read(audio_path, dtype="float64")
     mono = data.mean(axis=1) if data.ndim > 1 else data
     n = len(mono)
-    amp = 0.003 + (strength - 1) * 0.003       # 0.003 … 0.03
+
+    # Scale mask to a fraction of source RMS — keeps it inaudible regardless
+    # of source loudness. Floor at -60 dBFS so total silence still gets a tiny
+    # mask (otherwise leading silence would be a fingerprint signature).
+    src_rms = float(np.sqrt(np.mean(mono ** 2))) if n else 0.0
+    src_rms = max(src_rms, 0.001)
+    mask_ratio = 0.02 + (strength - 1) * 0.02   # 2% .. 20% of source RMS
+    amp = src_rms * mask_ratio
 
     # --- Pink noise (1/f) ---
     white = np.random.randn(n)
-    # Approximate pink via cumulative filter
     b = [0.049922035, -0.095993537, 0.050612699, -0.004709510]
     a = [1.0, -2.494956002, 2.017265875, -0.522189400]
     pink = lfilter(b, a, white)
@@ -400,27 +456,25 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 
     # --- FM tones targeting Whisper mel-spectrogram bins ---
     t = np.arange(n) / sr
-    # Sweep 200–800 Hz
-    fm_low = np.sin(2 * np.pi * (200 + 300 * np.sin(2 * np.pi * 0.5 * t)) * t)
-    fm_low *= amp * 0.3
-    # Sweep 3000–6000 Hz
-    fm_high = np.sin(2 * np.pi * (3000 + 1500 * np.sin(2 * np.pi * 0.3 * t)) * t)
-    fm_high *= amp * 0.25
+    fm_low = np.sin(2 * np.pi * (200 + 300 * np.sin(2 * np.pi * 0.5 * t)) * t) * amp * 0.3
+    fm_high = np.sin(2 * np.pi * (3000 + 1500 * np.sin(2 * np.pi * 0.3 * t)) * t) * amp * 0.25
 
-    # --- Phase distortion (all-pass style) ---
+    # --- Phase distortion (band-limited noise in mid range) ---
     sos = butter(4, [1000, 4000], btype="bandpass", fs=sr, output="sos")
     phase_dist = sosfilt(sos, np.random.randn(n)) * amp * 0.2
 
-    # Combine
     mask = pink + fm_low + fm_high + phase_dist
 
     if data.ndim > 1:
-        mask_stereo = np.stack([mask, mask], axis=-1)
-        result = data + mask_stereo[:len(data)]
+        # Slight per-channel decorrelation so stereo image isn't collapsed.
+        ch = data.shape[1]
+        result = data.copy()
+        for i in range(ch):
+            result[:, i] = data[:, i] + mask * (1.0 if i % 2 == 0 else 0.92)
     else:
-        result = data + mask[:len(data)]
+        result = data + mask
 
-    result = np.clip(result, -1.0, 1.0)
+    np.clip(result, -1.0, 1.0, out=result)
     sf.write(output_path, result, sr)
 
 
@@ -438,24 +492,7 @@ def process_video_file(src: Path, dst: Path, strength: int, profile: str,
     tmp_dir = dst.parent / f"_tmp_{dst.stem}"
     tmp_dir.mkdir(exist_ok=True)
 
-    # Default profile settings
-    settings = {
-        "warp": profile in ("tt_ads", "ghost"),
-        "chroma": profile in ("tt_ads", "ghost"),
-        "anti_ocr": profile in ("tt_ads",),
-        "distort_scene": profile in ("tt_ads", "ghost"),
-        "mask_audio": profile in ("tt_ads", "ghost"),
-        "audio_stealth": profile in ("tt_ads",),
-        "audio_fingerprint": profile in ("tt_ads",),
-        "v4_semantic": profile in ("tt_ads", "invisible"),
-        "deep_stealth": profile in ("tt_ads", "ghost"),
-        "dct_attack": profile in ("tt_ads", "ghost"),
-        "color_jitter": profile in ("tt_ads",),
-        "encoding_randomize": profile in ("tt_ads", "ghost"),
-        "metadata_strip": True
-    }
-    if custom_flags:
-        settings.update(custom_flags)
+    settings = resolve_profile(profile, custom_flags)
 
     try:
         cap = cv2.VideoCapture(str(src))
@@ -637,6 +674,7 @@ def _run_job_v5(job_id: str, files_meta: list, strength: int, profile: str, cust
     with jobs_lock:
         if job_id in jobs:
             jobs[job_id]["status"] = "done"
+            jobs[job_id]["finished_at"] = time.time()
 
 
 def _update_file_status(job_id: str, file_idx: int, status: str, progress: int):
@@ -648,6 +686,55 @@ def _update_file_status(job_id: str, file_idx: int, status: str, progress: int):
             total = sum(f["progress"] for f in jobs[job_id]["files"])
             count = len(jobs[job_id]["files"])
             jobs[job_id]["progress"] = int(total / count) if count else 0
+
+
+# ---------------------------------------------------------------------------
+# TTL cleanup
+# ---------------------------------------------------------------------------
+
+
+def _sweep_expired_jobs(now: float | None = None):
+    """Remove jobs older than JOB_TTL_SECONDS plus their on-disk artifacts."""
+    now = now or time.time()
+    expired = []
+    with jobs_lock:
+        for jid, job in list(jobs.items()):
+            ts = job.get("finished_at") or job.get("created_at") or 0
+            if now - ts > JOB_TTL_SECONDS:
+                expired.append(jid)
+                jobs.pop(jid, None)
+
+    for jid in expired:
+        for base in (UPLOAD_DIR, OUTPUT_DIR):
+            shutil.rmtree(base / jid, ignore_errors=True)
+    if expired:
+        logger.info("Cleanup: removed %d expired job(s)", len(expired))
+
+    # Sweep orphaned dirs (e.g. from a crash before job dict was populated).
+    for base in (UPLOAD_DIR, OUTPUT_DIR):
+        for entry in base.iterdir() if base.exists() else []:
+            if not entry.is_dir():
+                continue
+            with jobs_lock:
+                if entry.name in jobs:
+                    continue
+            try:
+                if now - entry.stat().st_mtime > JOB_TTL_SECONDS:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                pass
+
+
+def _cleanup_loop():
+    while True:
+        try:
+            _sweep_expired_jobs()
+        except Exception:
+            logger.exception("Cleanup loop error")
+        time.sleep(CLEANUP_INTERVAL_SECONDS)
+
+
+threading.Thread(target=_cleanup_loop, name="stealthmask-cleanup", daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +783,8 @@ def upload():
             "status": "pending",
             "progress": 0,
             "files": files_meta,
+            "created_at": time.time(),
+            "finished_at": None,
         }
 
     return jsonify({"job_id": job_id, "files": files_meta})
@@ -717,12 +806,9 @@ def process(job_id: str):
     profile = body.get("profile", "tt_ads")
     custom_flags = body.get("custom_flags", {})
 
-    t = threading.Thread(
-        target=_run_job_v5,
-        args=(job_id, job["files"], strength, profile, custom_flags),
-        daemon=True
+    job_executor.submit(
+        _run_job_v5, job_id, job["files"], strength, profile, custom_flags
     )
-    t.start()
     return jsonify({"status": "processing"})
 
 

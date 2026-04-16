@@ -27,4 +27,9 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:7860/ || exit 1
 
-CMD ["python", "app.py"]
+# Single worker on purpose: job state lives in-process. Threads handle
+# concurrent HTTP requests; the bounded ThreadPoolExecutor inside the app
+# caps how many jobs run in parallel.
+CMD ["gunicorn", "--bind", "0.0.0.0:7860", \
+     "--workers", "1", "--threads", "8", \
+     "--timeout", "600", "--access-logfile", "-", "app:app"]
