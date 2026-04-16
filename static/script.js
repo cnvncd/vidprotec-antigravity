@@ -31,8 +31,6 @@ const overallPct      = $("#overall-pct");
 const resultsSection  = $("#results-section");
 const resultsGrid     = $("#results-grid");
 const downloadAllBtn  = $("#download-all-btn");
-const strengthSlider  = $("#strength");
-const strengthValue   = $("#strength-value");
 
 // ---------------------------------------------------------------------------
 // Drag & Drop + File Input
@@ -150,13 +148,6 @@ function statusLabel(s) {
 }
 
 // ---------------------------------------------------------------------------
-// Strength slider
-// ---------------------------------------------------------------------------
-strengthSlider.addEventListener("input", () => {
-    strengthValue.textContent = strengthSlider.value;
-});
-
-// ---------------------------------------------------------------------------
 // Process
 // ---------------------------------------------------------------------------
 processBtn.addEventListener("click", startProcessing);
@@ -166,13 +157,11 @@ async function startProcessing() {
     state.processing = true;
     processBtn.disabled = true;
 
-    const payload = { strength: +strengthSlider.value };
-
     try {
         const res = await fetch(`/api/process/${state.jobId}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
+            body: "{}",
         });
         if (!res.ok) {
             const d = await res.json();
