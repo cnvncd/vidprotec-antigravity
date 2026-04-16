@@ -60,7 +60,7 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_MB * 1024 * 1024
 # How long uploads/outputs and their job records live before being swept.
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", str(60 * 60)))      # 1h default
 CLEANUP_INTERVAL_SECONDS = int(os.getenv("CLEANUP_INTERVAL_SECONDS", "300"))  # 5m
-MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "1"))
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"}
@@ -428,9 +428,14 @@ def _mask_audio(audio_path: str, output_path: str, strength: int):
 # ---------------------------------------------------------------------------
 
 
-# Cap workers per video so two concurrent video jobs don't oversubscribe
-# the CPU. Each job still gets plenty of parallelism.
+# Single-user mode: one video uses every CPU core. If MAX_CONCURRENT_JOBS
+# is raised, reduce by that factor to avoid oversubscribing the host.
 _VIDEO_WORKERS = max(2, (os.cpu_count() or 4) // max(1, MAX_CONCURRENT_JOBS))
+
+# Frames per submitted task. Batching amortizes pickle + IPC overhead
+# (~10–20 ms/frame) across multiple frames, so each worker spends more
+# time on actual filter work and less waiting on bytes.
+_FRAME_BATCH_SIZE = int(os.getenv("FRAME_BATCH_SIZE", "4"))
 
 # Process pool for per-frame work. ProcessPool (not ThreadPool) because the
 # filter stack hits GIL bottlenecks — Python bookkeeping between numpy/cv2
@@ -459,27 +464,33 @@ def _shutdown_frame_pool():
         _frame_pool = None
 
 
-def _process_video_frame(frame: np.ndarray, idx: int, strength: int,
+def _process_video_batch(frames: list, start_idx: int, strength: int,
                           global_seed: int, height: int, width: int,
                           pad_h: int, pad_w: int) -> tuple:
-    """Run the full per-frame filter stack. Returns (raw BGR bytes, work_seconds)."""
+    """Run the filter stack on a batch of frames. Returns (list of raw BGR
+    bytes in order, total worker time). Batching amortizes pickle/IPC cost."""
     t0 = time.perf_counter()
-    seed = global_seed + idx
-    frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
-    frame = _chroma_attack(frame, strength, seed)
-    frame = _dct_perturbation(frame, strength, seed)
-    frame = _color_gamma_jitter(frame, strength, seed)
+    out: list = []
+    for offset, frame in enumerate(frames):
+        idx = start_idx + offset
+        seed = global_seed + idx
 
-    processed = _adversarial_perturbation(
-        frame, strength, anti_ocr=True, distort_scene=True, seed=seed
-    )
+        frame = _elastic_warp(frame, strength, global_seed + (idx // 2))
+        frame = _chroma_attack(frame, strength, seed)
+        frame = _dct_perturbation(frame, strength, seed)
+        frame = _color_gamma_jitter(frame, strength, seed)
 
-    crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
-    processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
+        processed = _adversarial_perturbation(
+            frame, strength, anti_ocr=True, distort_scene=True, seed=seed
+        )
 
-    if not processed.flags["C_CONTIGUOUS"]:
-        processed = np.ascontiguousarray(processed)
-    return processed.tobytes(), time.perf_counter() - t0
+        crop = processed[pad_h:height-pad_h, pad_w:width-pad_w]
+        processed = cv2.resize(crop, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+        if not processed.flags["C_CONTIGUOUS"]:
+            processed = np.ascontiguousarray(processed)
+        out.append(processed.tobytes())
+    return out, time.perf_counter() - t0
 
 
 def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
@@ -529,50 +540,62 @@ def process_video_file(src: Path, dst: Path, strength: int, on_progress=None):
 
         logger.info(
             "[video] start src=%s res=%dx%d fps=%.2f frames=%d "
-            "cpu_count=%s workers=%d",
+            "cpu_count=%s workers=%d batch=%d",
             src.name, width, height, fps, total_frames,
-            os.cpu_count(), _VIDEO_WORKERS,
+            os.cpu_count(), _VIDEO_WORKERS, _FRAME_BATCH_SIZE,
         )
 
-        # Parallel frame processing: workers run the filter stack, main thread
-        # drains futures in submission order and pipes raw bytes to ffmpeg.
-        # Bounded inflight queue prevents the whole video from being read into RAM.
+        # Parallel batched frame processing: workers handle batches of frames,
+        # main thread drains batch futures in order and pipes raw bytes to
+        # ffmpeg. Bounded inflight keeps memory bounded.
         max_inflight = _VIDEO_WORKERS * 3
         futures: deque = deque()
         written = 0
-        total_work = 0.0        # sum of per-frame CPU seconds (from workers)
+        total_work = 0.0
         wall_start = time.perf_counter()
 
         def _drain_one():
             nonlocal written, total_work
-            data, work = futures.popleft().result()
-            ff.stdin.write(data)
+            batch_bytes, work = futures.popleft().result()
+            for data in batch_bytes:
+                ff.stdin.write(data)
+                written += 1
             total_work += work
-            written += 1
             if on_progress and total_frames > 0:
                 on_progress(int(written / total_frames * 90))
 
         pool = _get_frame_pool()
         try:
+            batch: list = []
+            batch_start = 0
             idx = 0
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                # Block when the queue is full so we don't read ahead forever.
-                while len(futures) >= max_inflight:
-                    _drain_one()
-
-                futures.append(pool.submit(
-                    _process_video_frame, frame, idx, strength,
-                    global_seed, height, width, pad_h, pad_w,
-                ))
+                batch.append(frame)
                 idx += 1
 
-                # Opportunistic drain — head ready? pipe it without blocking encode.
+                if len(batch) >= _FRAME_BATCH_SIZE:
+                    while len(futures) >= max_inflight:
+                        _drain_one()
+                    futures.append(pool.submit(
+                        _process_video_batch, batch, batch_start, strength,
+                        global_seed, height, width, pad_h, pad_w,
+                    ))
+                    batch_start = idx
+                    batch = []
+
                 while futures and futures[0].done():
                     _drain_one()
+
+            # Submit trailing partial batch.
+            if batch:
+                futures.append(pool.submit(
+                    _process_video_batch, batch, batch_start, strength,
+                    global_seed, height, width, pad_h, pad_w,
+                ))
 
             # Drain remaining in order.
             while futures:
